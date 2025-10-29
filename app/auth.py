@@ -64,7 +64,7 @@ async def login(request: Request, response: Response, username: str, password: s
         value=session_token,
         httponly=True,
         max_age=SESSION_EXPIRE_HOURS * 3600,
-        samesite="lax",  # ✅ "lax" works well for local testing
+        samesite="none",  # ✅ "lax" works well for local testing
         secure=False      # ✅ Change to True when you deploy with HTTPS
     )
     return {"id": user.id, "username": user.username}
