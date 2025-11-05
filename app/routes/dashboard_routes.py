@@ -5,7 +5,7 @@ from sqlalchemy import func, and_, or_
 from datetime import datetime, date, timedelta
 from typing import List
 from ..database import get_db
-from ..models import Loan, Customer, Alias, LoanStatus, Installment
+from ..models import Loan, Customer, Arrears, LoanStatus, Installment
 from ..auth import get_current_user
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
@@ -16,7 +16,7 @@ async def get_dashboard_metrics(
     current_user = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Get dashboard metrics: active loans count and aliases count"""
+    """Get dashboard metrics: active loans count and arrears count"""
     # Active loans (active + overdue)
     active_statuses = [LoanStatus.ACTIVE, LoanStatus.OVERDUE]
     active_loans_count_res = await db.execute(
@@ -24,39 +24,28 @@ async def get_dashboard_metrics(
     )
     active_loans = active_loans_count_res.scalar() or 0
 
-    # Total of loan amounts for active loans
-    total_loan_amounts_res = await db.execute(
-        select(func.coalesce(func.sum(Loan.total_amount), 0.0)).filter(Loan.status.in_(active_statuses))
+    # Outstanding for active loans should be the sum of remaining_amount
+    outstanding_res = await db.execute(
+        select(func.coalesce(func.sum(Loan.remaining_amount), 0.0)).filter(Loan.status.in_(active_statuses))
     )
-    total_loan_amounts = float(total_loan_amounts_res.scalar() or 0.0)
+    active_loans_outstanding = float(outstanding_res.scalar() or 0.0)
 
-    # Total of installments paid against active loans
-    total_installments_res = await db.execute(
-        select(func.coalesce(func.sum(func.coalesce(Installment.amount, 0.0)), 0.0))
-        .select_from(Installment)
-        .join(Loan, Loan.id == Installment.loan_id)
-        .filter(Loan.status.in_(active_statuses))
+    # Arrears counts and outstanding
+    active_arrears_count_res = await db.execute(
+        select(func.count(Arrears.id)).filter(Arrears.is_cleared == False)
     )
-    total_installments_paid = float(total_installments_res.scalar() or 0.0)
+    active_arrears = active_arrears_count_res.scalar() or 0
 
-    active_loans_outstanding = max(0.0, total_loan_amounts - total_installments_paid)
-
-    # Aliases counts and outstanding
-    active_aliases_count_res = await db.execute(
-        select(func.count(Alias.id)).filter(Alias.is_cleared == False)
+    arrears_outstanding_res = await db.execute(
+        select(func.coalesce(func.sum(Arrears.remaining_amount), 0.0)).filter(Arrears.is_cleared == False)
     )
-    active_aliases = active_aliases_count_res.scalar() or 0
-
-    aliases_outstanding_res = await db.execute(
-        select(func.coalesce(func.sum(Alias.remaining_amount), 0.0)).filter(Alias.is_cleared == False)
-    )
-    aliases_outstanding = float(aliases_outstanding_res.scalar() or 0.0)
+    arrears_outstanding = float(arrears_outstanding_res.scalar() or 0.0)
 
     return {
         "active_loans": active_loans,
         "active_loans_outstanding": round(active_loans_outstanding, 2),
-        "active_aliases": active_aliases,
-        "active_aliases_outstanding": round(aliases_outstanding, 2),
+        "active_arrears": active_arrears,
+        "active_arrears_outstanding": round(arrears_outstanding, 2),
     }
 
 
@@ -69,7 +58,7 @@ async def get_dashboard_summary(
     - Total amount of completed loans in the current month
     - Active loans (count) started in the current month
     - Total interest amount gained in the last three months
-    - Total aliases created in the last three months (count)
+    - Total arrears created in the last three months (count)
     """
     today = datetime.now().date()
     month_start = today.replace(day=1)
@@ -107,20 +96,20 @@ async def get_dashboard_summary(
     )
     interest_last_three_months = float(interest_res.scalar() or 0.0)
 
-    # Aliases created in last 3 months (count)
-    aliases_last3_res = await db.execute(
-        select(func.count(Alias.id)).filter(
-            Alias.alias_date >= last3_start,
-            Alias.alias_date <= today,
+    # Arrears created in last 3 months (count)
+    arrears_last3_res = await db.execute(
+        select(func.count(Arrears.id)).filter(
+            Arrears.arrears_date >= last3_start,
+            Arrears.arrears_date <= today,
         )
     )
-    aliases_count_last_three_months = int(aliases_last3_res.scalar() or 0)
+    arrears_count_last_three_months = int(arrears_last3_res.scalar() or 0)
 
     return {
         "completed_loans_amount_this_month": round(completed_loans_amount_this_month, 2),
         "active_loans_count_this_month": active_loans_count_this_month,
         "interest_last_three_months": round(interest_last_three_months, 2),
-        "aliases_count_last_three_months": aliases_count_last_three_months,
+        "arrears_count_last_three_months": arrears_count_last_three_months,
     }
 
 

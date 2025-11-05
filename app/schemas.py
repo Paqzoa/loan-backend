@@ -24,7 +24,7 @@ class LoanStatusEnum(str, Enum):
     ACTIVE = "active"
     COMPLETED = "completed"
     OVERDUE = "overdue"
-    ALIASED = "aliased"
+    ARREARS = "arrears"
 
 
 # ----------------------------------------------------
@@ -58,7 +58,7 @@ class CustomerCheckRequest(BaseModel):
 class CustomerCheck(BaseModel):
     exists: bool
     has_active_loan: bool
-    has_active_alias: bool
+    has_active_arrears: bool
     customer: Optional[CustomerResponse] = None
 
     class Config:
@@ -110,15 +110,15 @@ class InstallmentResponse(BaseModel):
 
 
 # ----------------------------------------------------
-# ALIAS SCHEMAS
+# ARREARS SCHEMAS
 # ----------------------------------------------------
-class AliasResponse(BaseModel):
+class ArrearsResponse(BaseModel):
     id: int
     loan_id: int
     customer_id: int
     original_amount: float
     remaining_amount: float
-    alias_date: date
+    arrears_date: date
     is_cleared: bool
     cleared_date: Optional[datetime]
     created_at: datetime

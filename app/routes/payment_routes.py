@@ -6,7 +6,7 @@ from datetime import datetime
 from pydantic import BaseModel
 from typing import Optional
 from ..database import get_db
-from ..models import Loan, Customer, Installment, LoanStatus
+from ..models import Loan, Customer, Installment, LoanStatus, Arrears
 from ..auth import get_current_user
 
 router = APIRouter(prefix="/payments", tags=["payments"])
@@ -37,18 +37,35 @@ async def record_payment(
             detail="Customer not found"
         )
     
-    # Find active loan for this customer
+    # Find ACTIVE loan only (overdue/arrears loans must be paid through arrears page)
     loan_result = await db.execute(
         select(Loan).filter(
             and_(
                 Loan.customer_id == payment.id_number,
-                Loan.status.in_([LoanStatus.ACTIVE, LoanStatus.OVERDUE])
+                Loan.status == LoanStatus.ACTIVE
             )
         ).order_by(Loan.id.desc())
     )
     loan = loan_result.scalar_one_or_none()
     
     if not loan:
+        # Check if they have overdue/arrears loans
+        overdue_check = await db.execute(
+            select(Loan).filter(
+                and_(
+                    Loan.customer_id == payment.id_number,
+                    Loan.status.in_([LoanStatus.OVERDUE, LoanStatus.ARREARS])
+                )
+            )
+        )
+        has_overdue = overdue_check.scalar_one_or_none() is not None
+        
+        if has_overdue:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This loan is overdue or in arrears. Please pay through the Arrears page."
+            )
+        
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No active loan found for this customer"
@@ -63,24 +80,54 @@ async def record_payment(
     
     db.add(installment)
     
-    # Check if loan is fully paid
-    total_paid_result = await db.execute(
-        select(func.sum(Installment.amount)).filter(
-            Installment.loan_id == loan.id
-        )
-    )
-    total_paid = total_paid_result.scalar() or 0
-    
-    if total_paid + payment.amount >= loan.total_amount:
+    # Update remaining amount on the loan
+    current_remaining = loan.remaining_amount if loan.remaining_amount is not None else loan.total_amount
+    new_remaining = max(0.0, current_remaining - payment.amount)
+    loan.remaining_amount = new_remaining
+
+    # Determine if fully paid
+    if new_remaining <= 0:
         loan.status = LoanStatus.COMPLETED
         loan.completed_at = datetime.utcnow()
+    else:
+        # If due date is past, mark as overdue and create/update arrears record
+        if loan.due_date and loan.due_date < datetime.utcnow().date():
+            # Mark status as ARREARS
+            loan.status = LoanStatus.ARREARS
+
+            # Find or create arrears for this loan
+            arrears_result = await db.execute(
+                select(Arrears).filter(Arrears.loan_id == loan.id)
+            )
+            arrears = arrears_result.scalar_one_or_none()
+
+            if not arrears:
+                # Need customer's internal id for Arrears.customer_id
+                customer_result2 = await db.execute(
+                    select(Customer).filter(Customer.id_number == loan.customer_id)
+                )
+                customer2 = customer_result2.scalar_one_or_none()
+                customer_int_id = customer2.id if customer2 else None
+
+                arrears = Arrears(
+                    loan_id=loan.id,
+                    customer_id=customer_int_id,
+                    original_amount=loan.total_amount,
+                    remaining_amount=new_remaining,
+                    is_cleared=False,
+                )
+                db.add(arrears)
+            else:
+                arrears.remaining_amount = new_remaining
     
     await db.commit()
     await db.refresh(installment)
+    await db.refresh(loan)
     
     return {
         "message": "Payment recorded successfully",
         "installment_id": installment.id,
-        "remaining_balance": max(0, loan.total_amount - (total_paid + payment.amount))
+        "remaining_balance": loan.remaining_amount,
+        "loan_status": loan.status.value,
     }
 

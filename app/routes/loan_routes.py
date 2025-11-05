@@ -4,7 +4,7 @@ from sqlalchemy.future import select
 from typing import List
 
 from ..database import get_db
-from ..models import Loan, Customer, LoanStatus, Alias
+from ..models import Loan, Customer, LoanStatus, Arrears
 from ..schemas import LoanCreate, LoanResponse
 from ..auth import get_current_user
 
@@ -37,19 +37,19 @@ async def create_loan(loan: LoanCreate, db: AsyncSession = Depends(get_db), curr
             detail="Customer already has an active loan"
         )
     
-    # Check for active aliases
-    alias_result = await db.execute(
-        select(Alias).filter(
-            Alias.customer_id == customer.id,
-            Alias.is_cleared == False
+    # Check for active arrears
+    arrears_result = await db.execute(
+        select(Arrears).filter(
+            Arrears.customer_id == customer.id,
+            Arrears.is_cleared == False
         )
     )
-    active_alias = alias_result.scalar_one_or_none()
+    active_arrears = arrears_result.scalar_one_or_none()
     
-    if active_alias:
+    if active_arrears:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Customer has an active alias that must be cleared first"
+            detail="Customer has active arrears that must be cleared first"
         )
     
     # Create new loan

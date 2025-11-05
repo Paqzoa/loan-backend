@@ -4,7 +4,7 @@ from sqlalchemy import text, select
 from app.database import engine, Base, AsyncSessionLocal
 from app import models
 from app.utils import hash_password
-from app.routes import auth_routes, customer_routes, loan_routes, dashboard_routes, payment_routes, alias_routes
+from app.routes import auth_routes, customer_routes, loan_routes, dashboard_routes, payment_routes, arrears_routes
 
 app = FastAPI(title="Loan Management System")
 
@@ -15,7 +15,7 @@ app.include_router(customer_routes.router)
 app.include_router(loan_routes.router)
 app.include_router(dashboard_routes.router)
 app.include_router(payment_routes.router)
-app.include_router(alias_routes.router)
+app.include_router(arrears_routes.router)
 
 
 

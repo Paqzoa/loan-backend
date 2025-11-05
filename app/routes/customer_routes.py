@@ -1,12 +1,20 @@
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import or_
+from sqlalchemy import or_, text
 from sqlalchemy.future import select
 from ..database import get_db
-from ..models import Customer, Loan, Alias, LoanStatus
+from ..models import Customer, Loan, Arrears, LoanStatus
 from ..schemas import CustomerCreate, CustomerResponse, CustomerCheck, CustomerCheckRequest
 from typing import List
 from ..auth import get_current_user
+
+# For PDF generation
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import inch
+from reportlab.lib import colors
+from reportlab.pdfgen import canvas
+import os
 
 router = APIRouter(prefix="/customers", tags=["customers"])
 
@@ -31,12 +39,23 @@ async def get_customer_by_id_number(
     db: AsyncSession = Depends(get_db),
     current_user=Depends(get_current_user)
 ):
+    # Find the customer
     result = await db.execute(select(Customer).filter(Customer.id_number == id_number))
     customer = result.scalar_one_or_none()
     if not customer:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found")
-    loans_result = await db.execute(select(Loan).filter(Loan.customer_id == id_number))
+
+    # 🔹 Filter only active (and overdue) loans
+    loans_result = await db.execute(
+        select(Loan)
+        .filter(
+            Loan.customer_id == customer.id_number,  # customer_id stores id_number
+            Loan.status.in_([LoanStatus.ACTIVE, LoanStatus.OVERDUE, LoanStatus.ARREARS])
+        )
+    )
     loans = loans_result.scalars().all()
+
+    # Return the customer and only active loans
     return {
         "id": customer.id,
         "name": customer.name,
@@ -48,7 +67,8 @@ async def get_customer_by_id_number(
         "loans": [
             {
                 "id": loan.id,
-                "amount": loan.amount,
+                "amount": loan.total_amount,
+                "remaining_amount": loan.remaining_amount,
                 "interest_rate": loan.interest_rate,
                 "total_amount": loan.total_amount,
                 "start_date": loan.start_date,
@@ -60,13 +80,14 @@ async def get_customer_by_id_number(
         ],
     }
 
+
 @router.get("/{customer_id}")
 async def get_customer_by_id(
     customer_id: int,
     db: AsyncSession = Depends(get_db),
     current_user=Depends(get_current_user)
 ):
-    """Get customer by ID with loans and aliases"""
+    """Get customer by ID with loans and arrears"""
     result = await db.execute(select(Customer).filter(Customer.id == customer_id))
     customer = result.scalar_one_or_none()
 
@@ -82,11 +103,24 @@ async def get_customer_by_id(
     )
     loans = loans_result.scalars().all()
     
-    # Get customer aliases
-    aliases_result = await db.execute(
-        select(Alias).filter(Alias.customer_id == customer.id)
+    # Get customer arrears
+    arrears_result = await db.execute(
+        select(Arrears).filter(Arrears.customer_id == customer.id)
     )
-    aliases = aliases_result.scalars().all()
+    arrears_list = arrears_result.scalars().all()
+    
+    # Get recent installments (for dashboard section below arrears)
+    installments_query = """
+        SELECT i.id, i.amount, i.payment_date, l.id as loan_id
+        FROM installments i
+        JOIN loans l ON i.loan_id = l.id
+        JOIN customers c ON l.customer_id = c.id_number
+        WHERE c.id = :cid
+        ORDER BY i.payment_date DESC
+        LIMIT 10
+    """
+    inst_result = await db.execute(text(installments_query), {"cid": customer.id})
+    inst_rows = inst_result.fetchall()
     
     return {
         "id": customer.id,
@@ -108,15 +142,24 @@ async def get_customer_by_id(
                 "created_at": loan.created_at
             } for loan in loans
         ],
-        "aliases": [
+        "arrears": [
             {
-                "id": alias.id,
-                "original_amount": alias.original_amount,
-                "remaining_amount": alias.remaining_amount,
-                "alias_date": alias.alias_date,
-                "is_cleared": alias.is_cleared,
-                "created_at": alias.created_at
-            } for alias in aliases
+                "id": arrears.id,
+                "original_amount": arrears.original_amount,
+                "remaining_amount": arrears.remaining_amount,
+                "arrears_date": arrears.arrears_date,
+                "is_cleared": arrears.is_cleared,
+                "created_at": arrears.created_at
+            } for arrears in arrears_list
+        ],
+        "installments": [
+            {
+                "id": r.id,
+                "amount": r.amount,
+                "payment_date": r.payment_date,
+                "loan_id": r.loan_id
+            }
+            for r in inst_rows
         ]
     }
 
@@ -127,7 +170,7 @@ async def check_customer_eligibility(
     db: AsyncSession = Depends(get_db),
     current_user=Depends(get_current_user)
 ):
-    """Check if customer exists and whether they have active loans or aliases"""
+    """Check if customer exists and whether they have active loans or arrears"""
     # Determine lookup key
     customer = None
     if request.customer_id is not None:
@@ -142,32 +185,32 @@ async def check_customer_eligibility(
         return {
             "exists": False,
             "has_active_loan": False,
-            "has_active_alias": False,
+            "has_active_arrears": False,
             "customer": None
         }
 
     # Check for active loans
     loan_result = await db.execute(
         select(Loan).filter(
-            Loan.customer_id == customer.id,
-            Loan.status.in_([LoanStatus.ACTIVE, LoanStatus.OVERDUE])
+            Loan.customer_id == customer.id_number,
+            Loan.status.in_([LoanStatus.ACTIVE, LoanStatus.OVERDUE, LoanStatus.ARREARS])
         )
     )
     active_loan = loan_result.scalar_one_or_none()
 
-    # Check for active aliases
-    alias_result = await db.execute(
-        select(Alias).filter(
-            Alias.customer_id == customer.id,
-            Alias.is_cleared == False
+    # Check for active arrears
+    arrears_result = await db.execute(
+        select(Arrears).filter(
+            Arrears.customer_id == customer.id,
+            Arrears.is_cleared == False
         )
     )
-    active_alias = alias_result.scalar_one_or_none()
+    active_arrears = arrears_result.scalar_one_or_none()
 
     return {
         "exists": True,
         "has_active_loan": active_loan is not None,
-        "has_active_alias": active_alias is not None,
+        "has_active_arrears": active_arrears is not None,
         "customer": {
             "id": customer.id,
             "name": customer.name,
@@ -178,7 +221,6 @@ async def check_customer_eligibility(
             "created_at": customer.created_at,
         }
     }
-
 
 
 @router.post("/", response_model=CustomerResponse)
@@ -234,3 +276,180 @@ async def search_customers(
         ).limit(20)
     )
     return result.scalars().all()
+
+
+# 🆕 -----------------------------
+# New endpoints added below
+# -----------------------------
+
+@router.get("/{customer_id}/installments")
+async def get_customer_installments(
+    customer_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user)
+):
+    """Return recent installments for a given customer"""
+    query = """
+        SELECT i.id, i.amount, i.payment_date, l.id as loan_id
+        FROM installments i
+        JOIN loans l ON i.loan_id = l.id
+        JOIN customers c ON l.customer_id = c.id_number
+        WHERE c.id = :cid
+        ORDER BY i.payment_date DESC
+        LIMIT 10
+    """
+    result = await db.execute(text(query), {"cid": customer_id})
+    rows = result.fetchall()
+
+    return [
+        {
+            "id": r.id,
+            "amount": r.amount,
+            "payment_date": r.payment_date,
+            "loan_id": r.loan_id
+        }
+        for r in rows
+    ]
+
+
+@router.get("/{customer_id}/report", response_class=FileResponse)
+async def generate_customer_report(
+    customer_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user)
+
+):
+    """Generate PDF report for a customer (loans + installments)"""
+
+    # Fetch customer
+    result = await db.execute(select(Customer).filter(Customer.id == customer_id))
+
+    customer = result.scalar_one_or_none()
+    
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+
+    # Fetch loans
+    loan_result = await db.execute(select(Loan).filter(Loan.customer_id == customer.id_number))
+    loans = loan_result.scalars().all()
+
+    # Fetch installments
+    query = """
+        SELECT i.id, i.amount, i.payment_date, l.id as loan_id
+        FROM installments i
+        JOIN loans l ON i.loan_id = l.id
+        JOIN customers c ON l.customer_id = c.id_number
+        WHERE c.id = :cid
+        ORDER BY i.payment_date DESC
+    """
+    inst_result = await db.execute(text(query), {"cid": customer_id})
+    installments = inst_result.fetchall()
+
+    # Generate PDF with styled header and sections
+    filename = f"customer_report_{customer.id}.pdf"
+    filepath = os.path.join("reports", filename)
+    os.makedirs("reports", exist_ok=True)
+
+    c = canvas.Canvas(filepath, pagesize=A4)
+    width, height = A4
+    margin_x = 1 * inch
+    y = height - 0.8 * inch
+
+    # Top themed header bar
+    c.setFillColor(colors.HexColor("#174064"))
+    c.setStrokeColor(colors.HexColor("#174064"))
+    c.rect(0, height - 1.1 * inch, width, 1.1 * inch, fill=1, stroke=0)
+
+    # Title: bold and underlined
+    c.setFillColor(colors.white)
+    c.setFont("Helvetica-Bold", 18)
+    title = "COMPREHENSIVE LOAN REPORT"
+    c.drawString(margin_x, height - 0.55 * inch, title)
+    title_width = c.stringWidth(title, "Helvetica-Bold", 18)
+    c.setStrokeColor(colors.white)
+    c.setLineWidth(2)
+    c.line(margin_x, height - 0.58 * inch, margin_x + title_width, height - 0.58 * inch)
+
+    # Subtitle: customer name
+    c.setFont("Helvetica", 11)
+    c.drawString(margin_x, height - 0.9 * inch, f"Customer: {customer.name} (ID#: {customer.id_number})")
+
+    # Reset drawing color for body
+    c.setFillColor(colors.black)
+    y = height - 1.4 * inch
+
+    c.setFont("Helvetica", 12)
+    c.drawString(1 * inch, y, f"ID Number: {customer.id_number}")
+    y -= 0.25 * inch
+    c.drawString(1 * inch, y, f"Phone: {customer.phone}")
+    y -= 0.25 * inch
+    c.drawString(1 * inch, y, f"Email: {customer.email or 'N/A'}")
+    y -= 0.25 * inch
+    c.drawString(1 * inch, y, f"Location: {customer.location or 'N/A'}")
+    y -= 0.5 * inch
+
+    # Section header helper
+    def draw_section_header(label: str):
+        nonlocal y
+        if y < 1 * inch:
+            c.showPage()
+            c.setFillColor(colors.black)
+            y = height - inch
+        c.setFillColor(colors.HexColor("#E9F0F6"))
+        c.setStrokeColor(colors.HexColor("#C5D6E5"))
+        c.rect(margin_x - 0.1 * inch, y - 0.15 * inch, width - 2 * margin_x + 0.2 * inch, 0.4 * inch, fill=1, stroke=0)
+        c.setFillColor(colors.HexColor("#174064"))
+        c.setFont("Helvetica-Bold", 14)
+        c.drawString(margin_x, y, label)
+        y -= 0.35 * inch
+        c.setFillColor(colors.black)
+        c.setFont("Helvetica", 11)
+
+    # Loans Section
+    draw_section_header("Loans Summary")
+    for loan in loans:
+        if y < 1 * inch:
+            c.showPage()
+            c.setFillColor(colors.black)
+            y = height - inch
+        c.setFont("Helvetica", 11)
+        c.drawString(margin_x, y, f"Loan ID: {loan.id}   Status: {loan.status.value}")
+        y -= 0.18 * inch
+        c.setFillColor(colors.HexColor("#2A6F3E"))
+        c.drawString(margin_x, y, f"Amount: {loan.amount}")
+        c.setFillColor(colors.black)
+        c.drawString(margin_x + 2.5 * inch, y, f"Interest: {loan.interest_rate}%")
+        y -= 0.18 * inch
+        c.drawString(margin_x, y, f"Start: {loan.start_date}    Due: {loan.due_date}")
+        y -= 0.22 * inch
+
+    # Installments Section
+    if y < 1 * inch:
+        c.showPage()
+        c.setFillColor(colors.black)
+        y = height - inch
+    draw_section_header("Recent Installments")
+
+    if not installments:
+        c.drawString(margin_x, y, "No installments available.")
+    else:
+        for i in installments:
+            if y < 1 * inch:
+                c.showPage()
+                c.setFillColor(colors.black)
+                y = height - inch
+            c.setFont("Helvetica", 11)
+            c.drawString(margin_x, y, f"Loan #{i.loan_id}")
+            c.setFillColor(colors.HexColor("#2A6F3E"))
+            c.drawString(margin_x + 1.6 * inch, y, f"Amount: {i.amount}")
+            c.setFillColor(colors.black)
+            c.drawString(margin_x + 3.6 * inch, y, f"Date: {i.payment_date}")
+            y -= 0.2 * inch
+
+    c.save()
+
+    return FileResponse(
+        filepath,
+        media_type="application/pdf",
+        filename=filename
+    )

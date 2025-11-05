@@ -102,11 +102,19 @@ async def get_current_user(request: Request, db=Depends(get_db)):
 
 async def change_password(data: ChangePasswordRequest, current_user: User, db):
     """Change user's password after verifying old password."""
+    # Verify old password using the user from the previous session
     if not verify_password(data.old_password, current_user.password):
         raise HTTPException(status_code=400, detail="Old password is incorrect")
 
-    current_user.password = hash_password(data.new_password)
-    db.add(current_user)
+    # Query user fresh in the current session to avoid session conflicts
+    result = await db.execute(select(User).filter_by(id=current_user.id))
+    user = result.scalar_one_or_none()
+    
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Update password in the current session
+    user.password = hash_password(data.new_password)
     await db.commit()
 
     return {"message": "Password changed successfully"}

@@ -25,13 +25,13 @@ class Customer(Base):
 
     # Relationships
     loans = relationship("Loan", back_populates="customer", cascade="all, delete-orphan")
-    aliases = relationship("Alias", back_populates="customer", cascade="all, delete-orphan")
+    arrears = relationship("Arrears", back_populates="customer", cascade="all, delete-orphan")
 
 class LoanStatus(enum.Enum):
-    ACTIVE = "active"
-    COMPLETED = "completed"
-    OVERDUE = "overdue"
-    ALIASED = "aliased"
+    ACTIVE = "ACTIVE"
+    COMPLETED = "COMPLETED"
+    OVERDUE = "OVERDUE"
+    ARREARS = "ARREARS"
 
 class Loan(Base):
     __tablename__ = "loans"
@@ -41,6 +41,8 @@ class Loan(Base):
     amount = Column(Float, nullable=False)
     interest_rate = Column(Float, default=20.0, nullable=False)  # 20% interest rate
     total_amount = Column(Float, nullable=False)  # Principal + Interest
+    # Remaining amount to be paid (initialized to total_amount)
+    remaining_amount = Column(Float, nullable=True)
     start_date = Column(Date, nullable=False, default=datetime.utcnow().date)
     due_date = Column(Date, nullable=False)
     status = Column(Enum(LoanStatus), default=LoanStatus.ACTIVE, nullable=False)
@@ -50,7 +52,7 @@ class Loan(Base):
     # Relationships
     customer = relationship("Customer", back_populates="loans")
     installments = relationship("Installment", back_populates="loan", cascade="all, delete-orphan")
-    alias = relationship("Alias", back_populates="loan", uselist=False, cascade="all, delete-orphan")
+    arrears = relationship("Arrears", back_populates="loan", uselist=False, cascade="all, delete-orphan")
 
     def __init__(self, **kwargs):
         super(Loan, self).__init__(**kwargs)
@@ -58,6 +60,9 @@ class Loan(Base):
         if 'amount' in kwargs:
             interest = kwargs.get('amount') * (kwargs.get('interest_rate', 20.0) / 100)
             self.total_amount = kwargs.get('amount') + interest
+            # Initialize remaining amount to total amount on creation
+            if self.remaining_amount is None:
+                self.remaining_amount = self.total_amount
         
         # Set due date (1 month from start date)
         if 'start_date' in kwargs:
@@ -83,19 +88,19 @@ class Installment(Base):
     # Relationship
     loan = relationship("Loan", back_populates="installments")
 
-class Alias(Base):
-    __tablename__ = "aliases"
+class Arrears(Base):
+    __tablename__ = "arrears"
 
     id = Column(Integer, primary_key=True, index=True)
     loan_id = Column(Integer, ForeignKey("loans.id"), nullable=False, unique=True)
     customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False)
     original_amount = Column(Float, nullable=False)  # Original loan amount
     remaining_amount = Column(Float, nullable=False)  # Unpaid amount including interest
-    alias_date = Column(Date, nullable=False, default=datetime.utcnow().date)
+    arrears_date = Column(Date, nullable=False, default=datetime.utcnow().date)
     is_cleared = Column(Boolean, default=False)
     cleared_date = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     
     # Relationships
-    loan = relationship("Loan", back_populates="alias")
-    customer = relationship("Customer", back_populates="aliases")
+    loan = relationship("Loan", back_populates="arrears")
+    customer = relationship("Customer", back_populates="arrears")
