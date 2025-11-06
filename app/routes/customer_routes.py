@@ -135,6 +135,7 @@ async def get_customer_by_id(
                 "id": loan.id,
                 "amount": loan.amount,
                 "interest_rate": loan.interest_rate,
+                "remaining_amount": loan.remaining_amount,
                 "total_amount": loan.total_amount,
                 "start_date": loan.start_date,
                 "due_date": loan.due_date,

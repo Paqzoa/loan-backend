@@ -85,13 +85,14 @@ async def get_dashboard_summary(
     )
     active_loans_count_this_month = int(active_this_month_res.scalar() or 0)
 
-    # Interest gained last 3 months: sum of interest for loans started in window
+    # Interest gained last 3 months: ONLY completed loans, based on completion date
     last3_start = today - timedelta(days=90)
     interest_res = await db.execute(
-        select(func.coalesce(func.sum(Loan.amount * (Loan.interest_rate / 100.0)), 0.0)).filter(
-            Loan.start_date >= last3_start,
-            Loan.start_date <= today,
-            Loan.status.in_([LoanStatus.ACTIVE, LoanStatus.COMPLETED, LoanStatus.OVERDUE])
+        select(func.coalesce(func.sum(Loan.total_amount - Loan.amount), 0.0)).filter(
+            Loan.status == LoanStatus.COMPLETED,
+            Loan.completed_at.isnot(None),
+            func.date(Loan.completed_at) >= last3_start,
+            func.date(Loan.completed_at) <= today,
         )
     )
     interest_last_three_months = float(interest_res.scalar() or 0.0)
@@ -137,23 +138,22 @@ async def get_trends(
         else:
             month_end = date(current.year, current.month + 1, 1) - timedelta(days=1)
         
-        # Get loans in this month
+        # Get loans COMPLETED in this month
         loans_result = await db.execute(
             select(Loan).filter(
                 and_(
-                    Loan.start_date >= month_start,
-                    Loan.start_date <= month_end,
-                    Loan.status.in_([LoanStatus.ACTIVE, LoanStatus.COMPLETED])
+                    Loan.status == LoanStatus.COMPLETED,
+                    Loan.completed_at.isnot(None),
+                    func.date(Loan.completed_at) >= month_start,
+                    func.date(Loan.completed_at) <= month_end,
                 )
             )
         )
         loans = loans_result.scalars().all()
         
-        # Calculate returns (total amount of active/completed loans)
+        # Calculate returns/interest for completed loans only
         returns = sum(loan.total_amount for loan in loans)
-        
-        # Calculate interest (total interest earned)
-        interest = sum(loan.amount * (loan.interest_rate / 100) for loan in loans)
+        interest = sum((loan.total_amount - loan.amount) for loan in loans)
         
         trends.append({
             "month": current.strftime("%b"),
