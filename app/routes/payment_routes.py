@@ -6,14 +6,19 @@ from datetime import datetime
 from pydantic import BaseModel
 from typing import Optional
 from ..database import get_db
-from ..models import Loan, Customer, Installment, LoanStatus, Arrears
+from ..models import Loan, Customer, Installment, LoanStatus
 from ..auth import get_current_user
+from ..services.loan_service import compute_weekly_progress, sync_overdue_state
 
 router = APIRouter(prefix="/payments", tags=["payments"])
 
 
 class PaymentCreate(BaseModel):
     id_number: str
+    amount: float
+
+
+class InstallmentUpdate(BaseModel):
     amount: float
 
 
@@ -37,7 +42,7 @@ async def record_payment(
             detail="Customer not found"
         )
     
-    # Find ACTIVE loan only (overdue/arrears loans must be paid through arrears page)
+    # Find ACTIVE loan only (overdue loans must be paid through the overdue page)
     loan_result = await db.execute(
         select(Loan).filter(
             and_(
@@ -63,7 +68,7 @@ async def record_payment(
         if has_overdue:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="This loan is overdue or in arrears. Please pay through the Arrears page."
+                detail="This loan is overdue. Please pay through the Overdue page."
             )
         
         raise HTTPException(
@@ -71,6 +76,17 @@ async def record_payment(
             detail="No active loan found for this customer"
         )
     
+    overdue_state_changed = await sync_overdue_state(db, loan)
+    if loan.status != LoanStatus.ACTIVE:
+        if overdue_state_changed:
+            await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This loan is overdue. Please pay through the Overdue page."
+        )
+
+    weekly_before = compute_weekly_progress(loan)
+
     # Create installment record
     installment = Installment(
         loan_id=loan.id,
@@ -89,36 +105,9 @@ async def record_payment(
     if new_remaining <= 0:
         loan.status = LoanStatus.COMPLETED
         loan.completed_at = datetime.utcnow()
-    else:
-        # If due date is past, mark as overdue and create/update arrears record
-        if loan.due_date and loan.due_date < datetime.utcnow().date():
-            # Mark status as ARREARS
-            loan.status = LoanStatus.ARREARS
+    weekly_after = compute_weekly_progress(loan)
 
-            # Find or create arrears for this loan
-            arrears_result = await db.execute(
-                select(Arrears).filter(Arrears.loan_id == loan.id)
-            )
-            arrears = arrears_result.scalar_one_or_none()
-
-            if not arrears:
-                # Need customer's internal id for Arrears.customer_id
-                customer_result2 = await db.execute(
-                    select(Customer).filter(Customer.id_number == loan.customer_id)
-                )
-                customer2 = customer_result2.scalar_one_or_none()
-                customer_int_id = customer2.id if customer2 else None
-
-                arrears = Arrears(
-                    loan_id=loan.id,
-                    customer_id=customer_int_id,
-                    original_amount=loan.total_amount,
-                    remaining_amount=new_remaining,
-                    is_cleared=False,
-                )
-                db.add(arrears)
-            else:
-                arrears.remaining_amount = new_remaining
+    await sync_overdue_state(db, loan)
     
     await db.commit()
     await db.refresh(installment)
@@ -127,6 +116,88 @@ async def record_payment(
     return {
         "message": "Payment recorded successfully",
         "installment_id": installment.id,
+        "remaining_balance": loan.remaining_amount,
+        "loan_status": loan.status.value,
+        "weekly_breakdown": {
+            "before": weekly_before,
+            "after": weekly_after,
+        },
+    }
+
+
+@router.put("/installments/{installment_id}")
+async def update_installment_amount(
+    installment_id: int,
+    body: InstallmentUpdate,
+    current_user = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update the amount of a specific installment and resync the loan balance/overdue state."""
+    if body.amount <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Amount must be positive",
+        )
+
+    inst_result = await db.execute(
+        select(Installment).filter(Installment.id == installment_id)
+    )
+    installment = inst_result.scalar_one_or_none()
+    if not installment:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Installment not found",
+        )
+
+    loan_result = await db.execute(
+        select(Loan).filter(Loan.id == installment.loan_id)
+    )
+    loan = loan_result.scalar_one_or_none()
+    if not loan:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Linked loan not found",
+        )
+
+    # Update installment amount
+    installment.amount = body.amount
+
+    # Recompute remaining amount from total installments
+    total_paid_res = await db.execute(
+        select(func.coalesce(func.sum(Installment.amount), 0.0)).filter(
+            Installment.loan_id == loan.id
+        )
+    )
+    total_paid = float(total_paid_res.scalar() or 0.0)
+    new_remaining = max(0.0, float(loan.total_amount) - total_paid)
+    loan.remaining_amount = new_remaining
+
+    # Adjust status based on remaining and due date.
+    # This can "re-open" a completed loan if a payment is edited down.
+    today = datetime.utcnow().date()
+    if new_remaining <= 0:
+        # Fully paid -> completed
+        loan.status = LoanStatus.COMPLETED
+        loan.completed_at = datetime.utcnow()
+    else:
+        # Not fully paid anymore -> clear completion timestamp
+        loan.completed_at = None
+        # If past due date, treat as overdue; otherwise active
+        if loan.due_date and loan.due_date < today:
+            loan.status = LoanStatus.OVERDUE
+        else:
+            loan.status = LoanStatus.ACTIVE
+
+    await sync_overdue_state(db, loan)
+
+    await db.commit()
+    await db.refresh(installment)
+    await db.refresh(loan)
+
+    return {
+        "message": "Installment updated successfully",
+        "installment_id": installment.id,
+        "new_amount": installment.amount,
         "remaining_balance": loan.remaining_amount,
         "loan_status": loan.status.value,
     }

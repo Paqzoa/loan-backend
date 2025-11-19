@@ -7,8 +7,27 @@ from typing import List
 from ..database import get_db
 from ..models import Loan, Customer, Arrears, LoanStatus, Installment
 from ..auth import get_current_user
+from ..services.loan_service import sync_overdue_state
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
+
+
+async def _refresh_overdue_states(db: AsyncSession):
+    today = datetime.utcnow().date()
+    result = await db.execute(
+        select(Loan).filter(
+            Loan.due_date.isnot(None),
+            Loan.due_date < today,
+            Loan.remaining_amount.isnot(None),
+            Loan.remaining_amount > 0,
+        )
+    )
+    loans = result.scalars().all()
+    state_changed = False
+    for loan in loans:
+        state_changed = await sync_overdue_state(db, loan) or state_changed
+    if state_changed:
+        await db.commit()
 
 
 @router.get("/metrics")
@@ -17,6 +36,7 @@ async def get_dashboard_metrics(
     db: AsyncSession = Depends(get_db)
 ):
     """Get dashboard metrics: active loans count and arrears count"""
+    await _refresh_overdue_states(db)
     # Active loans (active + overdue)
     active_statuses = [LoanStatus.ACTIVE, LoanStatus.OVERDUE]
     active_loans_count_res = await db.execute(
@@ -44,6 +64,9 @@ async def get_dashboard_metrics(
     return {
         "active_loans": active_loans,
         "active_loans_outstanding": round(active_loans_outstanding, 2),
+        "overdue_loans": active_arrears,
+        "overdue_outstanding": round(arrears_outstanding, 2),
+        # Backwards compatibility keys
         "active_arrears": active_arrears,
         "active_arrears_outstanding": round(arrears_outstanding, 2),
     }
@@ -58,8 +81,9 @@ async def get_dashboard_summary(
     - Total amount of completed loans in the current month
     - Active loans (count) started in the current month
     - Total interest amount gained in the last three months
-    - Total arrears created in the last three months (count)
+    - Total overdue records created in the last three months (count)
     """
+    await _refresh_overdue_states(db)
     today = datetime.now().date()
     month_start = today.replace(day=1)
 
@@ -97,7 +121,7 @@ async def get_dashboard_summary(
     )
     interest_last_three_months = float(interest_res.scalar() or 0.0)
 
-    # Arrears created in last 3 months (count)
+    # Overdue records created in last 3 months (count)
     arrears_last3_res = await db.execute(
         select(func.count(Arrears.id)).filter(
             Arrears.arrears_date >= last3_start,
@@ -110,6 +134,7 @@ async def get_dashboard_summary(
         "completed_loans_amount_this_month": round(completed_loans_amount_this_month, 2),
         "active_loans_count_this_month": active_loans_count_this_month,
         "interest_last_three_months": round(interest_last_three_months, 2),
+        "overdue_count_last_three_months": arrears_count_last_three_months,
         "arrears_count_last_three_months": arrears_count_last_three_months,
     }
 

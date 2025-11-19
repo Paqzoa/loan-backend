@@ -92,8 +92,8 @@ async def pay_arrears(arrears_id: int, body: ArrearsPayment,
             loan.status = LoanStatus.COMPLETED
             loan.completed_at = datetime.utcnow()
         else:
-            # Still owing; arrears loans remain ARREARS
-            loan.status = LoanStatus.ARREARS
+            # Still owing; overdue loans remain in OVERDUE status
+            loan.status = LoanStatus.OVERDUE
         db.add(loan)
 
     db.add(arrears)
@@ -126,6 +126,21 @@ async def clear_arrears(arrears_id: int,
     await db.commit()
     await db.refresh(arrears)
     return {"message": "Arrears cleared"}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

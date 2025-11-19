@@ -2,9 +2,10 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from typing import List
+from sqlalchemy.orm import selectinload
 
 from ..database import get_db
-from ..models import Loan, Customer, LoanStatus, Arrears
+from ..models import Loan, Customer, LoanStatus, Arrears, Guarantor
 from ..schemas import LoanCreate, LoanResponse
 from ..auth import get_current_user
 
@@ -52,15 +53,129 @@ async def create_loan(loan: LoanCreate, db: AsyncSession = Depends(get_db), curr
             detail="Customer has active arrears that must be cleared first"
         )
     
+    # Create guarantor if provided
+    guarantor_id = None
+    if loan.guarantor:
+        db_guarantor = Guarantor(
+            name=loan.guarantor.name,
+            id_number=loan.guarantor.id_number,
+            phone=loan.guarantor.phone,
+            location=loan.guarantor.location,
+            relationship=loan.guarantor.relationship
+        )
+        db.add(db_guarantor)
+        await db.flush()  # Flush to get the guarantor ID
+        guarantor_id = db_guarantor.id
+    
     # Create new loan
     db_loan = Loan(
         customer_id=loan.id_number,
+        guarantor_id=guarantor_id,
         amount=loan.amount,
-        interest_rate=loan.interest_rate,
+        interest_rate=20.0,
         start_date=loan.start_date
     )
     
     db.add(db_loan)
     await db.commit()
     await db.refresh(db_loan)
+    
+    # Load guarantor relationship if it exists
+    if db_loan.guarantor_id:
+        await db.refresh(db_loan, ["guarantor"])
+    
     return db_loan
+
+
+@router.get("/active")
+async def list_active_loans(
+    q: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """List active loans (ACTIVE and OVERDUE) with optional search by loan id or customer id_number."""
+    stmt = (
+        select(Loan)
+        .options(selectinload(Loan.guarantor), selectinload(Loan.customer))
+        .filter(Loan.status.in_([LoanStatus.ACTIVE, LoanStatus.OVERDUE]))
+        .order_by(Loan.created_at.desc())
+        .limit(limit).offset(offset)
+    )
+    if q:
+        if q.isdigit():
+            stmt = stmt.filter(Loan.id == int(q))
+        else:
+            stmt = stmt.filter(Loan.customer_id.ilike(f"%{q}%"))
+    result = await db.execute(stmt)
+    loans = result.scalars().all()
+    return [
+        {
+            "id": l.id,
+            "amount": l.amount,
+            "interest_rate": l.interest_rate,
+            "total_amount": l.total_amount,
+            "remaining_amount": l.remaining_amount,
+            "start_date": l.start_date,
+            "due_date": l.due_date,
+            "status": l.status.value,
+            "customer": {
+                "name": l.customer.name if l.customer else None,
+                "id_number": l.customer_id,
+                "phone": l.customer.phone if l.customer else None,
+                "location": l.customer.location if l.customer else None,
+            },
+            "guarantor": ({
+                "id": l.guarantor.id,
+                "name": l.guarantor.name,
+                "id_number": l.guarantor.id_number,
+                "phone": l.guarantor.phone,
+                "location": l.guarantor.location,
+                "relationship": l.guarantor.relationship,
+            } if l.guarantor else None),
+        }
+        for l in loans
+    ]
+
+
+@router.get("/{loan_id}")
+async def get_loan_details(
+    loan_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """Get detailed info for a specific loan including customer and guarantor."""
+    result = await db.execute(
+        select(Loan)
+        .options(selectinload(Loan.customer), selectinload(Loan.guarantor))
+        .filter(Loan.id == loan_id)
+    )
+    loan = result.scalar_one_or_none()
+    if not loan:
+        raise HTTPException(status_code=404, detail="Loan not found")
+    return {
+        "id": loan.id,
+        "amount": loan.amount,
+        "interest_rate": loan.interest_rate,
+        "total_amount": loan.total_amount,
+        "remaining_amount": loan.remaining_amount,
+        "start_date": loan.start_date,
+        "due_date": loan.due_date,
+        "status": loan.status.value,
+        "created_at": loan.created_at,
+        "customer": {
+            "name": loan.customer.name if loan.customer else None,
+            "id_number": loan.customer_id,
+            "phone": loan.customer.phone if loan.customer else None,
+            "location": loan.customer.location if loan.customer else None,
+        },
+        "guarantor": ({
+            "id": loan.guarantor.id,
+            "name": loan.guarantor.name,
+            "id_number": loan.guarantor.id_number,
+            "phone": loan.guarantor.phone,
+            "location": loan.guarantor.location,
+            "relationship": loan.guarantor.relationship,
+        } if loan.guarantor else None),
+    }

@@ -34,7 +34,6 @@ class CustomerBase(BaseModel):
     name: str
     id_number: str
     phone: str
-    email: Optional[str] = None
     location: Optional[str] = None
 
 
@@ -58,8 +57,31 @@ class CustomerCheckRequest(BaseModel):
 class CustomerCheck(BaseModel):
     exists: bool
     has_active_loan: bool
-    has_active_arrears: bool
+    has_overdue_loans: bool
     customer: Optional[CustomerResponse] = None
+
+    class Config:
+        orm_mode = True
+
+
+# ----------------------------------------------------
+# GUARANTOR SCHEMAS
+# ----------------------------------------------------
+class GuarantorBase(BaseModel):
+    name: str
+    id_number: str
+    phone: str
+    location: Optional[str] = None
+    relationship: Optional[str] = None
+
+
+class GuarantorCreate(GuarantorBase):
+    pass
+
+
+class GuarantorResponse(GuarantorBase):
+    id: int
+    created_at: datetime
 
     class Config:
         orm_mode = True
@@ -76,12 +98,13 @@ class LoanBase(BaseModel):
 
 
 class LoanCreate(LoanBase):
-    pass
+    guarantor: Optional[GuarantorCreate] = None
 
 
 class LoanResponse(BaseModel):
     id: int
     customer_id: str   # ✅ match the DB column
+    guarantor_id: Optional[int] = None
     amount: float
     interest_rate: float
     total_amount: float
@@ -90,6 +113,7 @@ class LoanResponse(BaseModel):
     status: str
     created_at: datetime
     completed_at: Optional[datetime] = None
+    guarantor: Optional[GuarantorResponse] = None
 
     class Config:
         orm_mode = True

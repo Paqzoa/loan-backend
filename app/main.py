@@ -39,13 +39,6 @@ async def startup_event():
             await conn.run_sync(Base.metadata.create_all)
             print("✅ Tables created or already exist.")
 
-            # Lightweight migration to add missing customer columns if they don't exist
-            try:
-                await conn.execute(text("ALTER TABLE customers ADD COLUMN email VARCHAR(120) NULL"))
-                print("✅ Added 'email' column to customers")
-            except Exception:
-                pass
-
             # Ensure loans.customer_id references customers.id_number (string)
             try:
                 await conn.execute(text("ALTER TABLE loans MODIFY COLUMN customer_id VARCHAR(30) NOT NULL"))

@@ -1,5 +1,5 @@
 from sqlalchemy import Column, Integer, String, DateTime, Float, Boolean, ForeignKey, Date, Enum
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship as orm_relationship
 from datetime import datetime, timedelta
 import enum
 from app.database import Base
@@ -19,13 +19,26 @@ class Customer(Base):
     name = Column(String(100), nullable=False)
     id_number = Column(String(30), unique=True, nullable=False)
     phone = Column(String(20), unique=True, nullable=False)
-    email = Column(String(120), nullable=True)
     location = Column(String(100))
     created_at = Column(DateTime, default=datetime.utcnow)
 
     # Relationships
-    loans = relationship("Loan", back_populates="customer", cascade="all, delete-orphan")
-    arrears = relationship("Arrears", back_populates="customer", cascade="all, delete-orphan")
+    loans = orm_relationship("Loan", back_populates="customer", cascade="all, delete-orphan")
+    arrears = orm_relationship("Arrears", back_populates="customer", cascade="all, delete-orphan")
+
+class Guarantor(Base):
+    __tablename__ = "guarantors"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), nullable=False)
+    id_number = Column(String(30), nullable=False)
+    phone = Column(String(20), nullable=False)
+    location = Column(String(100), nullable=True)
+    relationship = Column(String(50), nullable=True)  # e.g., "Friend", "Family", "Colleague"
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    loans = orm_relationship("Loan", back_populates="guarantor")
 
 class LoanStatus(enum.Enum):
     ACTIVE = "ACTIVE"
@@ -38,6 +51,7 @@ class Loan(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     customer_id = Column(String(30), ForeignKey("customers.id_number"), nullable=False)
+    guarantor_id = Column(Integer, ForeignKey("guarantors.id"), nullable=True)
     amount = Column(Float, nullable=False)
     interest_rate = Column(Float, default=20.0, nullable=False)  # 20% interest rate
     total_amount = Column(Float, nullable=False)  # Principal + Interest
@@ -50,9 +64,10 @@ class Loan(Base):
     completed_at = Column(DateTime, nullable=True)
     
     # Relationships
-    customer = relationship("Customer", back_populates="loans")
-    installments = relationship("Installment", back_populates="loan", cascade="all, delete-orphan")
-    arrears = relationship("Arrears", back_populates="loan", uselist=False, cascade="all, delete-orphan")
+    customer = orm_relationship("Customer", back_populates="loans")
+    guarantor = orm_relationship("Guarantor", back_populates="loans")
+    installments = orm_relationship("Installment", back_populates="loan", cascade="all, delete-orphan")
+    arrears = orm_relationship("Arrears", back_populates="loan", uselist=False, cascade="all, delete-orphan")
 
     def __init__(self, **kwargs):
         super(Loan, self).__init__(**kwargs)
@@ -86,7 +101,7 @@ class Installment(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     
     # Relationship
-    loan = relationship("Loan", back_populates="installments")
+    loan = orm_relationship("Loan", back_populates="installments")
 
 class Arrears(Base):
     __tablename__ = "arrears"
@@ -102,5 +117,5 @@ class Arrears(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     
     # Relationships
-    loan = relationship("Loan", back_populates="arrears")
-    customer = relationship("Customer", back_populates="arrears")
+    loan = orm_relationship("Loan", back_populates="arrears")
+    customer = orm_relationship("Customer", back_populates="arrears")

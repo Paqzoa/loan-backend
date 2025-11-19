@@ -3,6 +3,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import or_, text
 from sqlalchemy.future import select
+from sqlalchemy.orm import selectinload
 from ..database import get_db
 from ..models import Customer, Loan, Arrears, LoanStatus
 from ..schemas import CustomerCreate, CustomerResponse, CustomerCheck, CustomerCheckRequest
@@ -16,7 +17,55 @@ from reportlab.lib import colors
 from reportlab.pdfgen import canvas
 import os
 
+from ..services.loan_service import (
+    compute_weekly_progress,
+    loan_is_overdue_by_schedule,
+    sync_overdue_state,
+)
+
 router = APIRouter(prefix="/customers", tags=["customers"])
+
+
+async def _serialize_loans_with_progress(db: AsyncSession, loans: List[Loan]):
+    payload = []
+    state_changed = False
+
+    for loan in loans:
+        changed = await sync_overdue_state(db, loan)
+        state_changed = state_changed or changed
+
+        progress = compute_weekly_progress(loan)
+        payload.append(
+            {
+                "id": loan.id,
+                "amount": loan.amount,
+                "interest_rate": loan.interest_rate,
+                "remaining_amount": loan.remaining_amount,
+                "total_amount": loan.total_amount,
+                "start_date": loan.start_date,
+                "due_date": loan.due_date,
+                "status": loan.status.value,
+                "created_at": loan.created_at,
+                "weekly_progress": progress,
+                "weekly_due_amount": progress["weekly_due_amount"],
+                "weekly_arrears": progress["arrears_amount"],
+                "guarantor": {
+                    "id": loan.guarantor.id,
+                    "name": loan.guarantor.name,
+                    "id_number": loan.guarantor.id_number,
+                    "phone": loan.guarantor.phone,
+                    "location": loan.guarantor.location,
+                    "relationship": loan.guarantor.relationship,
+                }
+                if loan.guarantor
+                else None,
+            }
+        )
+
+    if state_changed:
+        await db.commit()
+
+    return payload
 
 
 @router.get("/")
@@ -45,15 +94,17 @@ async def get_customer_by_id_number(
     if not customer:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found")
 
-    # 🔹 Filter only active (and overdue) loans
+    # 🔹 Filter only active (and overdue) loans with guarantor relationship loaded
     loans_result = await db.execute(
         select(Loan)
+        .options(selectinload(Loan.guarantor))
         .filter(
             Loan.customer_id == customer.id_number,  # customer_id stores id_number
             Loan.status.in_([LoanStatus.ACTIVE, LoanStatus.OVERDUE, LoanStatus.ARREARS])
         )
     )
     loans = loans_result.scalars().all()
+    loan_payload = await _serialize_loans_with_progress(db, loans)
 
     # Return the customer and only active loans
     return {
@@ -61,23 +112,9 @@ async def get_customer_by_id_number(
         "name": customer.name,
         "id_number": customer.id_number,
         "phone": customer.phone,
-        "email": customer.email,
         "location": customer.location,
         "created_at": customer.created_at,
-        "loans": [
-            {
-                "id": loan.id,
-                "amount": loan.total_amount,
-                "remaining_amount": loan.remaining_amount,
-                "interest_rate": loan.interest_rate,
-                "total_amount": loan.total_amount,
-                "start_date": loan.start_date,
-                "due_date": loan.due_date,
-                "status": loan.status.value,
-                "created_at": loan.created_at,
-            }
-            for loan in loans
-        ],
+        "loans": loan_payload,
     }
 
 
@@ -97,11 +134,14 @@ async def get_customer_by_id(
             detail="Customer not found"
         )
     
-    # Get customer loans
+    # Get customer loans with guarantor relationship loaded
     loans_result = await db.execute(
-        select(Loan).filter(Loan.customer_id == customer.id_number)
+        select(Loan)
+        .options(selectinload(Loan.guarantor))
+        .filter(Loan.customer_id == customer.id_number)
     )
     loans = loans_result.scalars().all()
+    loan_payload = await _serialize_loans_with_progress(db, loans)
     
     # Get customer arrears
     arrears_result = await db.execute(
@@ -127,22 +167,9 @@ async def get_customer_by_id(
         "name": customer.name,
         "id_number": customer.id_number,
         "phone": customer.phone,
-        "email": customer.email,
         "location": customer.location,
         "created_at": customer.created_at,
-        "loans": [
-            {
-                "id": loan.id,
-                "amount": loan.amount,
-                "interest_rate": loan.interest_rate,
-                "remaining_amount": loan.remaining_amount,
-                "total_amount": loan.total_amount,
-                "start_date": loan.start_date,
-                "due_date": loan.due_date,
-                "status": loan.status.value,
-                "created_at": loan.created_at
-            } for loan in loans
-        ],
+        "loans": loan_payload,
         "arrears": [
             {
                 "id": arrears.id,
@@ -186,38 +213,55 @@ async def check_customer_eligibility(
         return {
             "exists": False,
             "has_active_loan": False,
-            "has_active_arrears": False,
+            "has_overdue_loans": False,
             "customer": None
         }
 
-    # Check for active loans
+    # Check for active (within-month) loans
     loan_result = await db.execute(
         select(Loan).filter(
             Loan.customer_id == customer.id_number,
-            Loan.status.in_([LoanStatus.ACTIVE, LoanStatus.OVERDUE, LoanStatus.ARREARS])
+            Loan.status == LoanStatus.ACTIVE
         )
     )
     active_loan = loan_result.scalar_one_or_none()
 
-    # Check for active arrears
+    # Check for overdue loans either by stored status or by schedule
+    overdue_result = await db.execute(
+        select(Loan).filter(
+            Loan.customer_id == customer.id_number,
+            Loan.status == LoanStatus.OVERDUE
+        )
+    )
+    has_overdue_loan = overdue_result.scalar_one_or_none() is not None
+
+    if not has_overdue_loan:
+        all_loans_result = await db.execute(
+            select(Loan).filter(Loan.customer_id == customer.id_number)
+        )
+        for loan in all_loans_result.scalars().all():
+            if loan_is_overdue_by_schedule(loan):
+                has_overdue_loan = True
+                break
+
     arrears_result = await db.execute(
         select(Arrears).filter(
             Arrears.customer_id == customer.id,
             Arrears.is_cleared == False
         )
     )
-    active_arrears = arrears_result.scalar_one_or_none()
+    active_overdue_records = arrears_result.scalar_one_or_none() is not None
+    has_overdue_loan = has_overdue_loan or active_overdue_records
 
     return {
         "exists": True,
         "has_active_loan": active_loan is not None,
-        "has_active_arrears": active_arrears is not None,
+        "has_overdue_loans": has_overdue_loan,
         "customer": {
             "id": customer.id,
             "name": customer.name,
             "id_number": customer.id_number,
             "phone": customer.phone,
-            "email": customer.email,
             "location": customer.location,
             "created_at": customer.created_at,
         }
@@ -383,8 +427,6 @@ async def generate_customer_report(
     c.drawString(1 * inch, y, f"ID Number: {customer.id_number}")
     y -= 0.25 * inch
     c.drawString(1 * inch, y, f"Phone: {customer.phone}")
-    y -= 0.25 * inch
-    c.drawString(1 * inch, y, f"Email: {customer.email or 'N/A'}")
     y -= 0.25 * inch
     c.drawString(1 * inch, y, f"Location: {customer.location or 'N/A'}")
     y -= 0.5 * inch
