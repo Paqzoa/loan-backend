@@ -36,8 +36,8 @@ async def startup_event():
         async with engine.begin() as conn:
             await conn.execute(text("SELECT 1"))
             print("✅ Database connection successful.")
-            await conn.run_sync(Base.metadata.create_all)
-            print("✅ Tables created or already exist.")
+            # await conn.run_sync(Base.metadata.create_all)
+            # print("✅ Tables created or already exist.")
 
             # Ensure loans.customer_id references customers.id_number (string)
             try:

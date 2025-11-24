@@ -1,15 +1,19 @@
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from typing import List
 from sqlalchemy.orm import selectinload
 
 from ..database import get_db
 from ..models import Loan, Customer, LoanStatus, Arrears, Guarantor
 from ..schemas import LoanCreate, LoanResponse
 from ..auth import get_current_user
+from ..services.loan_pdf_service import generate_loan_receipt
 
 router = APIRouter(prefix="/loans", tags=["loans"])
+logger = logging.getLogger(__name__)
 
 @router.post("/", response_model=LoanResponse)
 async def create_loan(loan: LoanCreate, db: AsyncSession = Depends(get_db), current_user = Depends(get_current_user)):
@@ -80,10 +84,17 @@ async def create_loan(loan: LoanCreate, db: AsyncSession = Depends(get_db), curr
     await db.commit()
     await db.refresh(db_loan)
     
-    # Load guarantor relationship if it exists
-    if db_loan.guarantor_id:
-        await db.refresh(db_loan, ["guarantor"])
+    # Load relationships
+    await db.refresh(db_loan, ["guarantor"])
+
+    # Generate receipt but don't block loan creation if it fails
+    document_url = f"/loans/{db_loan.id}/printable"
+    try:
+        generate_loan_receipt(db_loan, customer=customer, guarantor=db_loan.guarantor)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Failed to generate loan receipt for loan %s: %s", db_loan.id, exc)
     
+    setattr(db_loan, "document_url", document_url)
     return db_loan
 
 
@@ -179,3 +190,35 @@ async def get_loan_details(
             "relationship": loan.guarantor.relationship,
         } if loan.guarantor else None),
     }
+
+
+@router.get("/{loan_id}/printable", response_class=FileResponse)
+async def download_loan_receipt(
+    loan_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(get_current_user)
+):
+    """Generate or refresh the PDF summary for a specific loan."""
+    result = await db.execute(
+        select(Loan)
+        .options(selectinload(Loan.customer), selectinload(Loan.guarantor))
+        .filter(Loan.id == loan_id)
+    )
+    loan = result.scalar_one_or_none()
+    if not loan:
+        raise HTTPException(status_code=404, detail="Loan not found")
+
+    customer = loan.customer
+    if not customer:
+        cust_result = await db.execute(select(Customer).filter(Customer.id_number == loan.customer_id))
+        customer = cust_result.scalar_one_or_none()
+
+    if not customer:
+        raise HTTPException(status_code=500, detail="Customer details missing for this loan")
+
+    filepath, filename = generate_loan_receipt(loan, customer=customer, guarantor=loan.guarantor)
+    return FileResponse(
+        filepath,
+        media_type="application/pdf",
+        filename=filename
+    )

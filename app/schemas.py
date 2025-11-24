@@ -114,6 +114,7 @@ class LoanResponse(BaseModel):
     created_at: datetime
     completed_at: Optional[datetime] = None
     guarantor: Optional[GuarantorResponse] = None
+    document_url: Optional[str] = None
 
     class Config:
         orm_mode = True
