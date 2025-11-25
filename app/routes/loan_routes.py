@@ -136,6 +136,7 @@ async def list_active_loans(
                 "id_number": l.customer_id,
                 "phone": l.customer.phone if l.customer else None,
                 "location": l.customer.location if l.customer else None,
+                "profile_image_url": l.customer.profile_image_url if l.customer else None,
             },
             "guarantor": ({
                 "id": l.guarantor.id,
@@ -180,6 +181,7 @@ async def get_loan_details(
             "id_number": loan.customer_id,
             "phone": loan.customer.phone if loan.customer else None,
             "location": loan.customer.location if loan.customer else None,
+            "profile_image_url": loan.customer.profile_image_url if loan.customer else None,
         },
         "guarantor": ({
             "id": loan.guarantor.id,

@@ -35,6 +35,7 @@ class CustomerBase(BaseModel):
     id_number: str
     phone: str
     location: Optional[str] = None
+    profile_image_url: Optional[str] = None
 
 
 class CustomerCreate(CustomerBase):
@@ -47,6 +48,10 @@ class CustomerResponse(CustomerBase):
 
     class Config:
         orm_mode = True
+
+
+class CustomerPhotoUpdate(BaseModel):
+    profile_image_url: str
 
 
 class CustomerCheckRequest(BaseModel):

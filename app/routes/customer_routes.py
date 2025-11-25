@@ -1,3 +1,6 @@
+import re
+from urllib.parse import urlparse
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -6,7 +9,13 @@ from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
 from ..database import get_db
 from ..models import Customer, Loan, Arrears, LoanStatus
-from ..schemas import CustomerCreate, CustomerResponse, CustomerCheck, CustomerCheckRequest
+from ..schemas import (
+    CustomerCreate,
+    CustomerResponse,
+    CustomerCheck,
+    CustomerCheckRequest,
+    CustomerPhotoUpdate,
+)
 from typing import List
 from ..auth import get_current_user
 
@@ -24,6 +33,42 @@ from ..services.loan_service import (
 )
 
 router = APIRouter(prefix="/customers", tags=["customers"])
+
+CLOUDINARY_HOST = "res.cloudinary.com"
+ALLOWED_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+
+
+def _sanitize_image_url(url: str | None) -> str | None:
+    if not url:
+        return None
+    url = url.strip()
+    if len(url) > 600:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Image URL is too long",
+        )
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Image URL must use HTTPS",
+        )
+    if CLOUDINARY_HOST not in parsed.netloc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Only Cloudinary image URLs are allowed",
+        )
+    if parsed.path:
+        lowered = parsed.path.lower()
+        if not any(lowered.endswith(ext) for ext in ALLOWED_EXTENSIONS):
+            # Cloudinary can omit extensions when using format=auto.
+            # Allow such URLs if they contain '/image/upload' path segment.
+            if "/image/upload" not in lowered:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="Image URL must point to a valid image resource",
+                )
+    return url
 
 
 async def _serialize_loans_with_progress(db: AsyncSession, loans: List[Loan]):
@@ -113,6 +158,7 @@ async def get_customer_by_id_number(
         "id_number": customer.id_number,
         "phone": customer.phone,
         "location": customer.location,
+        "profile_image_url": customer.profile_image_url,
         "created_at": customer.created_at,
         "loans": loan_payload,
     }
@@ -168,6 +214,7 @@ async def get_customer_by_id(
         "id_number": customer.id_number,
         "phone": customer.phone,
         "location": customer.location,
+        "profile_image_url": customer.profile_image_url,
         "created_at": customer.created_at,
         "loans": loan_payload,
         "arrears": [
@@ -263,6 +310,7 @@ async def check_customer_eligibility(
             "id_number": customer.id_number,
             "phone": customer.phone,
             "location": customer.location,
+            "profile_image_url": customer.profile_image_url,
             "created_at": customer.created_at,
         }
     }
@@ -294,11 +342,34 @@ async def create_customer(
             detail=f"Customer with this {field} already exists",
         )
 
-    db_customer = Customer(**customer.dict())
+    payload = customer.dict()
+    payload["profile_image_url"] = _sanitize_image_url(payload.get("profile_image_url"))
+
+    db_customer = Customer(**payload)
     db.add(db_customer)
     await db.commit()
     await db.refresh(db_customer)
     return db_customer
+
+
+@router.patch("/{customer_id}/photo", response_model=CustomerResponse)
+async def update_customer_photo(
+    customer_id: int,
+    payload: CustomerPhotoUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """Update only the customer's profile image URL."""
+    sanitized_url = _sanitize_image_url(payload.profile_image_url)
+    result = await db.execute(select(Customer).filter(Customer.id == customer_id))
+    customer = result.scalar_one_or_none()
+    if not customer:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found")
+
+    customer.profile_image_url = sanitized_url
+    await db.commit()
+    await db.refresh(customer)
+    return customer
 
 
 @router.get("/search", response_model=List[CustomerResponse])

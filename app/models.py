@@ -20,6 +20,7 @@ class Customer(Base):
     id_number = Column(String(30), unique=True, nullable=False)
     phone = Column(String(20), unique=True, nullable=False)
     location = Column(String(100))
+    profile_image_url = Column(String(512), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     # Relationships
