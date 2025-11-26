@@ -98,6 +98,11 @@ async def record_payment(
     
     # Update remaining amount on the loan
     current_remaining = loan.remaining_amount if loan.remaining_amount is not None else loan.total_amount
+    if payment.amount > current_remaining:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Payment amount cannot exceed remaining balance",
+        )
     new_remaining = max(0.0, current_remaining - payment.amount)
     loan.remaining_amount = new_remaining
 
@@ -198,6 +203,70 @@ async def update_installment_amount(
         "message": "Installment updated successfully",
         "installment_id": installment.id,
         "new_amount": installment.amount,
+        "remaining_balance": loan.remaining_amount,
+        "loan_status": loan.status.value,
+    }
+
+
+@router.delete("/installments/{installment_id}")
+async def delete_installment(
+    installment_id: int,
+    current_user = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Delete a specific installment and resync the loan balance/overdue state.
+    This effectively reverses the impact of that installment on the loan.
+    """
+    inst_result = await db.execute(
+        select(Installment).filter(Installment.id == installment_id)
+    )
+    installment = inst_result.scalar_one_or_none()
+    if not installment:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Installment not found",
+        )
+
+    loan_result = await db.execute(select(Loan).filter(Loan.id == installment.loan_id))
+    loan = loan_result.scalar_one_or_none()
+    if not loan:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Linked loan not found",
+        )
+
+    # Remove the installment
+    await db.delete(installment)
+
+    # Recompute remaining from remaining installments
+    total_paid_res = await db.execute(
+        select(func.coalesce(func.sum(Installment.amount), 0.0)).filter(
+            Installment.loan_id == loan.id
+        )
+    )
+    total_paid = float(total_paid_res.scalar() or 0.0)
+    new_remaining = max(0.0, float(loan.total_amount) - total_paid)
+    loan.remaining_amount = new_remaining
+
+    today = datetime.utcnow().date()
+    if new_remaining <= 0:
+        loan.status = LoanStatus.COMPLETED
+        loan.completed_at = datetime.utcnow()
+    else:
+        loan.completed_at = None
+        if loan.due_date and loan.due_date < today:
+            loan.status = LoanStatus.OVERDUE
+        else:
+            loan.status = LoanStatus.ACTIVE
+
+    await sync_overdue_state(db, loan)
+
+    await db.commit()
+    await db.refresh(loan)
+
+    return {
+        "message": "Installment deleted successfully",
         "remaining_balance": loan.remaining_amount,
         "loan_status": loan.status.value,
     }
