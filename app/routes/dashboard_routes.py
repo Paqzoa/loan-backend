@@ -92,6 +92,7 @@ async def get_dashboard_summary(
     - Active loans (count) started in the current month
     - Total interest amount gained in the last three months
     - Total overdue records created in the last three months (count)
+    - Total amount paid today
     - Total amount paid in the current week (Sunday to Saturday)
     - Total amount paid in the current month
     """
@@ -163,12 +164,21 @@ async def get_dashboard_summary(
     )
     total_paid_this_month = float(monthly_payments_res.scalar() or 0.0)
 
+    # Total amount paid today
+    daily_payments_res = await db.execute(
+        select(func.coalesce(func.sum(Installment.amount), 0.0)).filter(
+            func.date(Installment.payment_date) == today,
+        )
+    )
+    total_paid_today = float(daily_payments_res.scalar() or 0.0)
+
     return {
         "completed_loans_amount_this_month": round(completed_loans_amount_this_month, 2),
         "active_loans_count_this_month": active_loans_count_this_month,
         "interest_last_three_months": round(interest_last_three_months, 2),
         "overdue_count_last_three_months": arrears_count_last_three_months,
         "arrears_count_last_three_months": arrears_count_last_three_months,
+        "total_paid_today": round(total_paid_today, 2),
         "total_paid_this_week": round(total_paid_this_week, 2),
         "total_paid_this_month": round(total_paid_this_month, 2),
     }
