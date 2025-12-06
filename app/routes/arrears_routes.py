@@ -2,11 +2,12 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import func
+from sqlalchemy.orm import selectinload
 from datetime import datetime
 from pydantic import BaseModel
 from typing import Optional
 from ..database import get_db
-from ..models import Arrears, Customer, Loan, LoanStatus
+from ..models import Arrears, Customer, Loan, LoanStatus, Installment
 from ..auth import get_current_user
 
 router = APIRouter(prefix="/arrears", tags=["arrears"])
@@ -20,7 +21,7 @@ async def list_arrears(
     db: AsyncSession = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
-    q = select(Arrears).order_by(Arrears.created_at.desc())
+    q = select(Arrears).options(selectinload(Arrears.customer)).order_by(Arrears.created_at.desc())
     if only_active:
         q = q.filter(Arrears.is_cleared == False)
     q = q.limit(limit).offset(offset)
@@ -30,6 +31,7 @@ async def list_arrears(
         {
             "id": a.id,
             "customer_id": a.customer_id,
+            "customer_name": a.customer.name if a.customer else None,
             "loan_id": a.loan_id,
             "original_amount": a.original_amount,
             "remaining_amount": a.remaining_amount,
@@ -79,7 +81,8 @@ async def pay_arrears(arrears_id: int, body: ArrearsPayment,
     if body.amount <= 0:
         raise HTTPException(status_code=400, detail="Amount must be positive")
 
-    arrears.remaining_amount = max(0.0, float(arrears.remaining_amount) - float(body.amount))
+    payment_amount = float(body.amount)
+    arrears.remaining_amount = max(0.0, float(arrears.remaining_amount) - payment_amount)
 
     # Sync loan remaining amount and status
     loan_res = await db.execute(select(Loan).filter(Loan.id == arrears.loan_id))
@@ -96,10 +99,24 @@ async def pay_arrears(arrears_id: int, body: ArrearsPayment,
             loan.status = LoanStatus.OVERDUE
         db.add(loan)
 
+    # Create an Installment record to track this payment for weekly/monthly reporting
+    installment = Installment(
+        loan_id=arrears.loan_id,
+        amount=payment_amount,
+        payment_date=datetime.utcnow()
+    )
+    db.add(installment)
+
     db.add(arrears)
     await db.commit()
     await db.refresh(arrears)
-    return {"message": "Arrears payment recorded", "remaining_amount": arrears.remaining_amount, "is_cleared": arrears.is_cleared}
+    await db.refresh(installment)
+    return {
+        "message": "Arrears payment recorded",
+        "remaining_amount": arrears.remaining_amount,
+        "is_cleared": arrears.is_cleared,
+        "installment_id": installment.id
+    }
 
 
 @router.post("/{arrears_id}/clear")
@@ -111,10 +128,15 @@ async def clear_arrears(arrears_id: int,
     arrears = res.scalar_one_or_none()
     if not arrears:
         raise HTTPException(status_code=404, detail="Arrears not found")
+    
+    # Get the amount being cleared (remaining amount before clearing)
+    cleared_amount = float(arrears.remaining_amount)
+    
     arrears.remaining_amount = 0.0
     arrears.is_cleared = True
     arrears.cleared_date = datetime.utcnow()
     db.add(arrears)
+    
     # also complete linked loan and zero remaining
     loan_res = await db.execute(select(Loan).filter(Loan.id == arrears.loan_id))
     loan = loan_res.scalar_one_or_none()
@@ -123,6 +145,17 @@ async def clear_arrears(arrears_id: int,
         loan.status = LoanStatus.COMPLETED
         loan.completed_at = datetime.utcnow()
         db.add(loan)
+    
+    # Create an Installment record to track this payment for weekly/monthly reporting
+    # Only create if there's an amount being cleared
+    if cleared_amount > 0:
+        installment = Installment(
+            loan_id=arrears.loan_id,
+            amount=cleared_amount,
+            payment_date=datetime.utcnow()
+        )
+        db.add(installment)
+    
     await db.commit()
     await db.refresh(arrears)
     return {"message": "Arrears cleared"}

@@ -428,6 +428,104 @@ async def get_customer_installments(
     ]
 
 
+@router.delete("/{customer_id}")
+async def delete_customer(
+    customer_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user)
+):
+    """Delete a customer and all related records.
+    Cannot delete if customer has active or overdue loans.
+    """
+    # Find the customer
+    result = await db.execute(select(Customer).filter(Customer.id == customer_id))
+    customer = result.scalar_one_or_none()
+    
+    if not customer:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Customer not found"
+        )
+    
+    # Check for active loans
+    active_loans_result = await db.execute(
+        select(Loan).filter(
+            Loan.customer_id == customer.id_number,
+            Loan.status == LoanStatus.ACTIVE
+        )
+    )
+    active_loans = active_loans_result.scalars().all()
+    
+    if active_loans:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot delete customer with active loans. Please complete or cancel all active loans first."
+        )
+    
+    # Check for overdue/arrears loans
+    overdue_loans_result = await db.execute(
+        select(Loan).filter(
+            Loan.customer_id == customer.id_number,
+            Loan.status.in_([LoanStatus.OVERDUE, LoanStatus.ARREARS])
+        )
+    )
+    overdue_loans = overdue_loans_result.scalars().all()
+    
+    if overdue_loans:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot delete customer with overdue loans. Please clear all overdue balances first."
+        )
+    
+    # Check for active arrears records
+    active_arrears_result = await db.execute(
+        select(Arrears).filter(
+            Arrears.customer_id == customer.id,
+            Arrears.is_cleared == False
+        )
+    )
+    active_arrears = active_arrears_result.scalars().all()
+    
+    if active_arrears:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot delete customer with active arrears. Please clear all arrears first."
+        )
+    
+    # All checks passed - safe to delete
+    # Since Loan.customer_id references customers.id_number (not customers.id),
+    # we need to manually delete loans first to ensure proper cascading
+    # The ORM cascade will handle installments when we delete loans
+    
+    # Get all loans for this customer
+    all_loans_result = await db.execute(
+        select(Loan).filter(Loan.customer_id == customer.id_number)
+    )
+    all_loans = all_loans_result.scalars().all()
+    
+    # Delete all loans (this will cascade to installments via ORM relationship)
+    for loan in all_loans:
+        await db.delete(loan)
+    
+    # Delete all arrears records (they reference customer.id)
+    all_arrears_result = await db.execute(
+        select(Arrears).filter(Arrears.customer_id == customer.id)
+    )
+    all_arrears = all_arrears_result.scalars().all()
+    
+    for arrears in all_arrears:
+        await db.delete(arrears)
+    
+    # Finally, delete the customer
+    await db.delete(customer)
+    await db.commit()
+    
+    return {
+        "message": "Customer and all related records deleted successfully",
+        "customer_id": customer_id
+    }
+
+
 @router.get("/{customer_id}/report", response_class=FileResponse)
 async def generate_customer_report(
     customer_id: int,

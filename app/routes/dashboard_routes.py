@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import func, and_, or_
 from datetime import datetime, date, timedelta
-from typing import List
+from typing import List, Tuple
 from ..database import get_db
 from ..models import Loan, Customer, Arrears, LoanStatus, Installment
 from ..auth import get_current_user
@@ -72,6 +72,16 @@ async def get_dashboard_metrics(
     }
 
 
+def get_week_start_end(today: date) -> Tuple[date, date]:
+    """Get the start (Sunday) and end (Saturday) of the calendar week for a given date."""
+    # Get the day of the week (0 = Monday, 6 = Sunday)
+    # We want Sunday = 0, so we adjust: (today.weekday() + 1) % 7
+    days_since_sunday = (today.weekday() + 1) % 7
+    week_start = today - timedelta(days=days_since_sunday)
+    week_end = week_start + timedelta(days=6)
+    return week_start, week_end
+
+
 @router.get("/summary")
 async def get_dashboard_summary(
     current_user = Depends(get_current_user),
@@ -82,10 +92,15 @@ async def get_dashboard_summary(
     - Active loans (count) started in the current month
     - Total interest amount gained in the last three months
     - Total overdue records created in the last three months (count)
+    - Total amount paid in the current week (Sunday to Saturday)
+    - Total amount paid in the current month
     """
     await _refresh_overdue_states(db)
     today = datetime.now().date()
     month_start = today.replace(day=1)
+    
+    # Calculate current week (Sunday to Saturday)
+    week_start, week_end = get_week_start_end(today)
 
     # Completed loans amount in current month
     completed_res = await db.execute(
@@ -130,12 +145,32 @@ async def get_dashboard_summary(
     )
     arrears_count_last_three_months = int(arrears_last3_res.scalar() or 0)
 
+    # Total amount paid this week (Sunday to Saturday)
+    weekly_payments_res = await db.execute(
+        select(func.coalesce(func.sum(Installment.amount), 0.0)).filter(
+            func.date(Installment.payment_date) >= week_start,
+            func.date(Installment.payment_date) <= week_end,
+        )
+    )
+    total_paid_this_week = float(weekly_payments_res.scalar() or 0.0)
+
+    # Total amount paid this month
+    monthly_payments_res = await db.execute(
+        select(func.coalesce(func.sum(Installment.amount), 0.0)).filter(
+            func.date(Installment.payment_date) >= month_start,
+            func.date(Installment.payment_date) <= today,
+        )
+    )
+    total_paid_this_month = float(monthly_payments_res.scalar() or 0.0)
+
     return {
         "completed_loans_amount_this_month": round(completed_loans_amount_this_month, 2),
         "active_loans_count_this_month": active_loans_count_this_month,
         "interest_last_three_months": round(interest_last_three_months, 2),
         "overdue_count_last_three_months": arrears_count_last_three_months,
         "arrears_count_last_three_months": arrears_count_last_three_months,
+        "total_paid_this_week": round(total_paid_this_week, 2),
+        "total_paid_this_month": round(total_paid_this_month, 2),
     }
 
 
