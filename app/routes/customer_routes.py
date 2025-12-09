@@ -124,7 +124,35 @@ async def list_customers(
     result = await db.execute(
         select(Customer).order_by(Customer.created_at.desc()).limit(limit).offset(offset)
     )
-    return result.scalars().all()
+    customers = result.scalars().all()
+
+    # Determine which customers currently have active loans
+    customer_id_numbers = [c.id_number for c in customers]
+    if customer_id_numbers:
+        active_result = await db.execute(
+          select(Loan.customer_id).filter(
+              Loan.customer_id.in_(customer_id_numbers),
+              Loan.status == LoanStatus.ACTIVE
+          )
+        )
+        active_customer_ids = {row[0] for row in active_result.fetchall()}
+    else:
+        active_customer_ids = set()
+
+    # Return serialized payload with has_active_loan flag
+    return [
+        {
+            "id": c.id,
+            "name": c.name,
+            "id_number": c.id_number,
+            "phone": c.phone,
+            "location": c.location,
+            "profile_image_url": c.profile_image_url,
+            "created_at": c.created_at,
+            "has_active_loan": c.id_number in active_customer_ids,
+        }
+        for c in customers
+    ]
 
 
 @router.get("/by-id-number/{id_number}")

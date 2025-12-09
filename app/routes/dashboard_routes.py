@@ -1,9 +1,15 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import func, and_, or_
+from sqlalchemy import func, and_, or_, text
 from datetime import datetime, date, timedelta
 from typing import List, Tuple
+from fastapi.responses import FileResponse
+import os
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import inch
+from reportlab.lib import colors
+from reportlab.pdfgen import canvas
 from ..database import get_db
 from ..models import Loan, Customer, Arrears, LoanStatus, Installment
 from ..auth import get_current_user
@@ -268,4 +274,127 @@ async def get_recent_activity(
         })
     
     return activities
+
+
+@router.get("/payments-report", response_class=FileResponse)
+async def download_payments_report(
+    date_str: str | None = None,
+    current_user = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Generate a PDF listing all payments made on a specific date (defaults to today)."""
+    target_date = datetime.utcnow().date() if not date_str else datetime.strptime(date_str, "%Y-%m-%d").date()
+
+    query = """
+        SELECT 
+            i.id as installment_id,
+            i.amount as payment_amount,
+            i.payment_date as payment_date,
+            l.id as loan_id,
+            l.amount as principal_amount,
+            l.total_amount as total_amount,
+            l.remaining_amount as remaining_amount,
+            c.name as customer_name,
+            c.id_number as customer_id_number,
+            c.phone as customer_phone
+        FROM installments i
+        JOIN loans l ON i.loan_id = l.id
+        JOIN customers c ON l.customer_id = c.id_number
+        WHERE DATE(i.payment_date) = :pdate
+        ORDER BY i.payment_date DESC
+    """
+
+    result = await db.execute(text(query), {"pdate": target_date})
+    rows = result.fetchall()
+
+    filename = f"payments_{target_date.isoformat()}.pdf"
+    filepath = os.path.join("reports", filename)
+    os.makedirs("reports", exist_ok=True)
+
+    c = canvas.Canvas(filepath, pagesize=A4)
+    width, height = A4
+    margin_x = 0.85 * inch
+    y = height - 0.8 * inch
+
+    # Header bar
+    c.setFillColor(colors.HexColor("#0F172A"))
+    c.rect(0, height - 1.0 * inch, width, 1.0 * inch, fill=1, stroke=0)
+    c.setFillColor(colors.white)
+    c.setFont("Helvetica-Bold", 18)
+    title = f"Payments Report"
+    c.drawString(margin_x, height - 0.5 * inch, title)
+    c.setFont("Helvetica", 11)
+    c.drawString(margin_x, height - 0.75 * inch, f"Date: {target_date.strftime('%B %d, %Y')}")
+
+    y = height - 1.3 * inch
+
+    # Summary pills
+    total_payments = sum(float(r.payment_amount or 0) for r in rows)
+    pill_height = 0.45 * inch
+    pill_width = (width - 2 * margin_x - 0.3 * inch) / 2
+
+    def draw_pill(x, label, value, accent):
+        nonlocal y
+        c.setFillColor(colors.HexColor(accent))
+        c.roundRect(x, y - pill_height, pill_width, pill_height, 8, fill=1, stroke=0)
+        c.setFillColor(colors.white)
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(x + 0.15 * inch, y - 0.17 * inch, label)
+        c.setFont("Helvetica-Bold", 13)
+        c.drawRightString(x + pill_width - 0.15 * inch, y - 0.17 * inch, value)
+
+    draw_pill(margin_x, "Total Payments", f"KSh {total_payments:,.2f}", "#16A34A")
+    draw_pill(margin_x + pill_width + 0.3 * inch, "Payments Count", str(len(rows)), "#1D4ED8")
+    y -= pill_height + 0.35 * inch
+
+    # Table headers
+    c.setFont("Helvetica-Bold", 10)
+    c.setFillColor(colors.HexColor("#0F172A"))
+    headers = ["Time", "Customer", "ID", "Phone", "Loan #", "Amount"]
+    widths = [0.9, 1.6, 1.2, 1.2, 0.8, 1.1]
+    col_positions = [margin_x]
+    for w in widths[:-1]:
+        col_positions.append(col_positions[-1] + w * inch)
+    col_positions.append(margin_x + sum(widths) * inch)
+
+    header_y = y
+    c.setFillColor(colors.HexColor("#E2E8F0"))
+    c.rect(margin_x - 0.08 * inch, header_y - 0.3 * inch, sum(widths) * inch + 0.16 * inch, 0.35 * inch, fill=1, stroke=0)
+    c.setFillColor(colors.HexColor("#0F172A"))
+    for i, h in enumerate(headers):
+        c.drawString(col_positions[i] + 0.05 * inch, header_y - 0.1 * inch, h)
+    y = header_y - 0.4 * inch
+
+    c.setFont("Helvetica", 10)
+    for r in rows:
+        if y < 1.0 * inch:
+            c.showPage()
+            y = height - inch
+            c.setFont("Helvetica", 10)
+
+        values = [
+            r.payment_date.strftime("%H:%M"),
+            (r.customer_name or "")[:22],
+            r.customer_id_number,
+            r.customer_phone or "-",
+            str(r.loan_id),
+            f"KSh {float(r.payment_amount or 0):,.2f}",
+        ]
+
+        for i, v in enumerate(values):
+            c.drawString(col_positions[i] + 0.05 * inch, y, v)
+        y -= 0.28 * inch
+
+    if not rows:
+        c.setFont("Helvetica-Oblique", 11)
+        c.setFillColor(colors.HexColor("#6B7280"))
+        c.drawString(margin_x, y, "No payments recorded for this date.")
+
+    c.save()
+
+    return FileResponse(
+        filepath,
+        media_type="application/pdf",
+        filename=filename
+    )
 
