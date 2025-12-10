@@ -8,7 +8,7 @@ from sqlalchemy.orm import selectinload
 
 from ..database import get_db
 from ..models import Loan, Customer, LoanStatus, Arrears, Guarantor
-from ..schemas import LoanCreate, LoanResponse
+from ..schemas import LoanCreate, LoanResponse, LoanUpdate
 from ..auth import get_current_user
 from ..services.loan_pdf_service import generate_loan_receipt
 
@@ -96,6 +96,47 @@ async def create_loan(loan: LoanCreate, db: AsyncSession = Depends(get_db), curr
     
     setattr(db_loan, "document_url", document_url)
     return db_loan
+
+
+@router.patch("/{loan_id}", response_model=LoanResponse)
+async def update_loan(
+    loan_id: int,
+    payload: LoanUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(get_current_user),
+):
+    """Update loan principal/interest and recompute totals, preserving amounts already paid."""
+    result = await db.execute(
+        select(Loan).filter(Loan.id == loan_id).options(selectinload(Loan.guarantor), selectinload(Loan.customer))
+    )
+    loan = result.scalar_one_or_none()
+    if not loan:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Loan not found")
+
+    # Optional guard: prevent edits on completed loans
+    if loan.status == LoanStatus.COMPLETED:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot edit a completed loan")
+
+    # Calculate already-paid amount before changes
+    already_paid = max(0.0, float(loan.total_amount or 0) - float(loan.remaining_amount or 0))
+
+    # Apply new principal and interest
+    new_interest_rate = payload.interest_rate if payload.interest_rate is not None else (loan.interest_rate or 20.0)
+    new_total = float(payload.amount) + float(payload.amount) * (new_interest_rate / 100.0)
+
+    loan.amount = float(payload.amount)
+    loan.interest_rate = float(new_interest_rate)
+    loan.total_amount = new_total
+    loan.remaining_amount = max(0.0, new_total - already_paid)
+
+    # Persist
+    await db.commit()
+    await db.refresh(loan)
+    await db.refresh(loan, ["guarantor", "customer"])
+
+    document_url = f"/loans/{loan.id}/printable"
+    setattr(loan, "document_url", document_url)
+    return loan
 
 
 @router.get("/active")

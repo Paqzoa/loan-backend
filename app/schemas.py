@@ -106,6 +106,11 @@ class LoanCreate(LoanBase):
     guarantor: Optional[GuarantorCreate] = None
 
 
+class LoanUpdate(BaseModel):
+    amount: float
+    interest_rate: Optional[float] = None
+
+
 class LoanResponse(BaseModel):
     id: int
     customer_id: str   # ✅ match the DB column
