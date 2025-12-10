@@ -1,4 +1,5 @@
 import logging
+from datetime import timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import FileResponse
@@ -8,7 +9,7 @@ from sqlalchemy.orm import selectinload
 
 from ..database import get_db
 from ..models import Loan, Customer, LoanStatus, Arrears, Guarantor
-from ..schemas import LoanCreate, LoanResponse, LoanUpdate
+from ..schemas import LoanCreate, LoanResponse, LoanUpdate, GuarantorUpdate
 from ..auth import get_current_user
 from ..services.loan_pdf_service import generate_loan_receipt
 
@@ -105,7 +106,7 @@ async def update_loan(
     db: AsyncSession = Depends(get_db),
     current_user = Depends(get_current_user),
 ):
-    """Update loan principal/interest and recompute totals, preserving amounts already paid."""
+    """Update loan details (amount, interest, dates) and recompute totals, preserving amounts already paid."""
     result = await db.execute(
         select(Loan).filter(Loan.id == loan_id).options(selectinload(Loan.guarantor), selectinload(Loan.customer))
     )
@@ -120,14 +121,29 @@ async def update_loan(
     # Calculate already-paid amount before changes
     already_paid = max(0.0, float(loan.total_amount or 0) - float(loan.remaining_amount or 0))
 
-    # Apply new principal and interest
-    new_interest_rate = payload.interest_rate if payload.interest_rate is not None else (loan.interest_rate or 20.0)
-    new_total = float(payload.amount) + float(payload.amount) * (new_interest_rate / 100.0)
+    # Update amount if provided
+    if payload.amount is not None:
+        loan.amount = float(payload.amount)
 
-    loan.amount = float(payload.amount)
-    loan.interest_rate = float(new_interest_rate)
+    # Update interest rate if provided
+    if payload.interest_rate is not None:
+        loan.interest_rate = float(payload.interest_rate)
+
+    # Recalculate total_amount based on current amount and interest_rate
+    new_interest_rate = loan.interest_rate or 20.0
+    new_total = float(loan.amount) + float(loan.amount) * (new_interest_rate / 100.0)
     loan.total_amount = new_total
     loan.remaining_amount = max(0.0, new_total - already_paid)
+
+    # Update dates if provided
+    if payload.start_date is not None:
+        loan.start_date = payload.start_date
+        # If due_date not explicitly provided, recalculate it (30 days from start_date)
+        if payload.due_date is None:
+            loan.due_date = payload.start_date + timedelta(days=30)
+    
+    if payload.due_date is not None:
+        loan.due_date = payload.due_date
 
     # Persist
     await db.commit()
@@ -265,3 +281,51 @@ async def download_loan_receipt(
         media_type="application/pdf",
         filename=filename
     )
+
+
+@router.patch("/{loan_id}/guarantor/{guarantor_id}", response_model=LoanResponse)
+async def update_guarantor(
+    loan_id: int,
+    guarantor_id: int,
+    payload: GuarantorUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(get_current_user),
+):
+    """Update guarantor details for a specific loan."""
+    # Verify loan exists and belongs to this guarantor
+    result = await db.execute(
+        select(Loan).filter(Loan.id == loan_id, Loan.guarantor_id == guarantor_id)
+        .options(selectinload(Loan.guarantor), selectinload(Loan.customer))
+    )
+    loan = result.scalar_one_or_none()
+    if not loan:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Loan or guarantor not found")
+
+    if loan.status == LoanStatus.COMPLETED:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot edit guarantor for a completed loan")
+
+    # Get guarantor
+    guarantor_result = await db.execute(select(Guarantor).filter(Guarantor.id == guarantor_id))
+    guarantor = guarantor_result.scalar_one_or_none()
+    if not guarantor:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Guarantor not found")
+
+    # Update guarantor fields
+    if payload.name is not None:
+        guarantor.name = payload.name
+    if payload.id_number is not None:
+        guarantor.id_number = payload.id_number
+    if payload.phone is not None:
+        guarantor.phone = payload.phone
+    if payload.location is not None:
+        guarantor.location = payload.location
+    if payload.relationship is not None:
+        guarantor.relationship = payload.relationship
+
+    await db.commit()
+    await db.refresh(loan)
+    await db.refresh(loan, ["guarantor", "customer"])
+
+    document_url = f"/loans/{loan.id}/printable"
+    setattr(loan, "document_url", document_url)
+    return loan

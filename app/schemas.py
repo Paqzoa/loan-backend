@@ -107,8 +107,18 @@ class LoanCreate(LoanBase):
 
 
 class LoanUpdate(BaseModel):
-    amount: float
+    amount: Optional[float] = None
     interest_rate: Optional[float] = None
+    start_date: Optional[date] = None
+    due_date: Optional[date] = None
+
+
+class GuarantorUpdate(BaseModel):
+    name: Optional[str] = None
+    id_number: Optional[str] = None
+    phone: Optional[str] = None
+    location: Optional[str] = None
+    relationship: Optional[str] = None
 
 
 class LoanResponse(BaseModel):
