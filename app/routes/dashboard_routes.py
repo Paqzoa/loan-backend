@@ -42,7 +42,7 @@ async def get_dashboard_metrics(
     db: AsyncSession = Depends(get_db)
 ):
     """Get dashboard metrics: active loans count and arrears count"""
-    await _refresh_overdue_states(db)
+    # await _refresh_overdue_states(db)
     # Active loans (active + overdue)
     active_statuses = [LoanStatus.ACTIVE, LoanStatus.OVERDUE]
     active_loans_count_res = await db.execute(
