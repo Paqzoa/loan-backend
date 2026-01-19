@@ -102,7 +102,7 @@ async def get_dashboard_summary(
     - Total amount paid in the current week (Sunday to Saturday)
     - Total amount paid in the current month
     """
-    await _refresh_overdue_states(db)
+    # await _refresh_overdue_states(db)
     today = datetime.now().date()
     month_start = today.replace(day=1)
     
