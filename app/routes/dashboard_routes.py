@@ -14,6 +14,8 @@ from ..database import get_db
 from ..models import Loan, Customer, Arrears, LoanStatus, Installment
 from ..auth import get_current_user
 from ..services.loan_service import sync_overdue_state
+from datetime import datetime, timedelta, time
+from sqlalchemy import select, func
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
