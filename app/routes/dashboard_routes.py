@@ -93,91 +93,117 @@ async def get_dashboard_summary(
     current_user = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Return high-level summary figures for the dashboard side panel.
-    - Total amount of completed loans in the current month
-    - Active loans (count) started in the current month
-    - Total interest amount gained in the last three months
-    - Total overdue records created in the last three months (count)
-    - Total amount paid today
-    - Total amount paid in the current week (Sunday to Saturday)
-    - Total amount paid in the current month
-    """
-    # await _refresh_overdue_states(db)
-    today = datetime.now().date()
-    month_start = today.replace(day=1)
-    
-    # Calculate current week (Sunday to Saturday)
-    week_start, week_end = get_week_start_end(today)
+    today = datetime.utcnow().date()
 
-    # Completed loans amount in current month
+    # Month range
+    month_start_date = today.replace(day=1)
+    month_start_dt = datetime.combine(month_start_date, time.min)
+    today_end_dt = datetime.combine(today, time.max)
+
+    # Week range (Sunday → Saturday)
+    week_start, week_end = get_week_start_end(today)
+    week_start_dt = datetime.combine(week_start, time.min)
+    week_end_dt = datetime.combine(week_end, time.max)
+
+    # Last 3 months
+    last3_start_date = today - timedelta(days=90)
+    last3_start_dt = datetime.combine(last3_start_date, time.min)
+
+    # -----------------------------
+    # Completed loans amount (month)
+    # -----------------------------
     completed_res = await db.execute(
         select(func.coalesce(func.sum(Loan.total_amount), 0.0))
-        .filter(
+        .where(
             Loan.status == LoanStatus.COMPLETED,
             Loan.completed_at.isnot(None),
-            func.date(Loan.completed_at) >= month_start,
-            func.date(Loan.completed_at) <= today,
+            Loan.completed_at >= month_start_dt,
+            Loan.completed_at <= today_end_dt,
         )
     )
     completed_loans_amount_this_month = float(completed_res.scalar() or 0.0)
 
-    # Active loans count started this month
+    # -----------------------------
+    # Active loans count (this month)
+    # -----------------------------
     active_this_month_res = await db.execute(
-        select(func.count(Loan.id)).filter(
+        select(func.count(Loan.id))
+        .where(
             Loan.status.in_([LoanStatus.ACTIVE, LoanStatus.OVERDUE]),
-            Loan.start_date >= month_start,
+            Loan.start_date >= month_start_date,
             Loan.start_date <= today,
         )
     )
     active_loans_count_this_month = int(active_this_month_res.scalar() or 0)
 
-    # Interest gained last 3 months: ONLY completed loans, based on completion date
-    last3_start = today - timedelta(days=90)
+    # -----------------------------
+    # Interest last 3 months
+    # -----------------------------
     interest_res = await db.execute(
-        select(func.coalesce(func.sum(Loan.total_amount - Loan.amount), 0.0)).filter(
+        select(func.coalesce(func.sum(Loan.total_amount - Loan.amount), 0.0))
+        .where(
             Loan.status == LoanStatus.COMPLETED,
             Loan.completed_at.isnot(None),
-            func.date(Loan.completed_at) >= last3_start,
-            func.date(Loan.completed_at) <= today,
+            Loan.completed_at >= last3_start_dt,
+            Loan.completed_at <= today_end_dt,
         )
     )
     interest_last_three_months = float(interest_res.scalar() or 0.0)
 
-    # Overdue records created in last 3 months (count)
+    # -----------------------------
+    # Overdue records last 3 months
+    # -----------------------------
     arrears_last3_res = await db.execute(
-        select(func.count(Arrears.id)).filter(
-            Arrears.arrears_date >= last3_start,
+        select(func.count(Arrears.id))
+        .where(
+            Arrears.arrears_date >= last3_start_date,
             Arrears.arrears_date <= today,
         )
     )
     arrears_count_last_three_months = int(arrears_last3_res.scalar() or 0)
 
-    # Total amount paid this week (Sunday to Saturday)
+    # -----------------------------
+    # Payments this week
+    # -----------------------------
     weekly_payments_res = await db.execute(
-        select(func.coalesce(func.sum(Installment.amount), 0.0)).filter(
-            func.date(Installment.payment_date) >= week_start,
-            func.date(Installment.payment_date) <= week_end,
+        select(func.coalesce(func.sum(Installment.amount), 0.0))
+        .where(
+            Installment.payment_date >= week_start_dt,
+            Installment.payment_date <= week_end_dt,
         )
     )
     total_paid_this_week = float(weekly_payments_res.scalar() or 0.0)
 
-    # Total amount paid this month
+    # -----------------------------
+    # Payments this month
+    # -----------------------------
     monthly_payments_res = await db.execute(
-        select(func.coalesce(func.sum(Installment.amount), 0.0)).filter(
-            func.date(Installment.payment_date) >= month_start,
-            func.date(Installment.payment_date) <= today,
+        select(func.coalesce(func.sum(Installment.amount), 0.0))
+        .where(
+            Installment.payment_date >= month_start_dt,
+            Installment.payment_date <= today_end_dt,
         )
     )
     total_paid_this_month = float(monthly_payments_res.scalar() or 0.0)
 
-    # Total amount paid today
+    # -----------------------------
+    # Payments today
+    # -----------------------------
+    today_start_dt = datetime.combine(today, time.min)
+    today_end_dt = datetime.combine(today, time.max)
+
     daily_payments_res = await db.execute(
-        select(func.coalesce(func.sum(Installment.amount), 0.0)).filter(
-            func.date(Installment.payment_date) == today,
+        select(func.coalesce(func.sum(Installment.amount), 0.0))
+        .where(
+            Installment.payment_date >= today_start_dt,
+            Installment.payment_date <= today_end_dt,
         )
     )
     total_paid_today = float(daily_payments_res.scalar() or 0.0)
 
+    # -----------------------------
+    # Response (UNCHANGED)
+    # -----------------------------
     return {
         "completed_loans_amount_this_month": round(completed_loans_amount_this_month, 2),
         "active_loans_count_this_month": active_loans_count_this_month,
