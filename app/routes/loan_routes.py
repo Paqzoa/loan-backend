@@ -1,5 +1,7 @@
 import logging
 from datetime import timedelta
+from fastapi import Query
+from sqlalchemy import or_
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import FileResponse
@@ -155,57 +157,88 @@ async def update_loan(
     return loan
 
 
+
+
 @router.get("/active")
 async def list_active_loans(
     q: str | None = None,
-    limit: int = 50,
-    offset: int = 0,
+    limit: int = Query(50, le=100),
+    offset: int = Query(0),
     db: AsyncSession = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
-    """List active loans (ACTIVE and OVERDUE) with optional search by loan id or customer id_number."""
-    stmt = (
+    base_stmt = (
         select(Loan)
         .options(selectinload(Loan.guarantor), selectinload(Loan.customer))
-        .filter(Loan.status.in_([LoanStatus.ACTIVE, LoanStatus.OVERDUE]))
-        .order_by(Loan.created_at.desc())
-        .limit(limit).offset(offset)
+        .where(Loan.status.in_([LoanStatus.ACTIVE, LoanStatus.OVERDUE]))
     )
+
+    # 🔍 FILTER FIRST
     if q:
+        q = q.strip()
+        # Always join Customer for search since we need to search customer fields
+        base_stmt = base_stmt.join(Customer)
+
+        # Always allow searching by customer fields (including phone)
+        filters = [
+            Customer.name.ilike(f"%{q}%"),
+            Customer.phone.ilike(f"%{q}%"),
+            Customer.id_number.ilike(f"%{q}%"),
+        ]
+
+        # Additionally allow exact loan-id lookup when input is numeric
         if q.isdigit():
-            stmt = stmt.filter(Loan.id == int(q))
-        else:
-            stmt = stmt.filter(Loan.customer_id.ilike(f"%{q}%"))
+            filters.append(Loan.id == int(q))
+
+        base_stmt = base_stmt.where(or_(*filters))
+
+
+    # 📄 THEN paginate
+    stmt = (
+        base_stmt
+        .order_by(Loan.created_at.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+
     result = await db.execute(stmt)
     loans = result.scalars().all()
-    return [
-        {
-            "id": l.id,
-            "amount": l.amount,
-            "interest_rate": l.interest_rate,
-            "total_amount": l.total_amount,
-            "remaining_amount": l.remaining_amount,
-            "start_date": l.start_date,
-            "due_date": l.due_date,
-            "status": l.status.value,
-            "customer": {
-                "name": l.customer.name if l.customer else None,
-                "id_number": l.customer_id,
-                "phone": l.customer.phone if l.customer else None,
-                "location": l.customer.location if l.customer else None,
-                "profile_image_url": l.customer.profile_image_url if l.customer else None,
-            },
-            "guarantor": ({
-                "id": l.guarantor.id,
-                "name": l.guarantor.name,
-                "id_number": l.guarantor.id_number,
-                "phone": l.guarantor.phone,
-                "location": l.guarantor.location,
-                "relationship": l.guarantor.relationship,
-            } if l.guarantor else None),
-        }
-        for l in loans
-    ]
+
+    return {
+        "items": [
+            {
+                "id": l.id,
+                "amount": l.amount,
+                "interest_rate": l.interest_rate,
+                "total_amount": l.total_amount,
+                "remaining_amount": l.remaining_amount,
+                "start_date": l.start_date,
+                "due_date": l.due_date,
+                "status": l.status.value,
+                "customer": {
+                    "name": l.customer.name if l.customer else None,
+                    "id_number": l.customer_id,
+                    "phone": l.customer.phone if l.customer else None,
+                    "location": l.customer.location if l.customer else None,
+                    "profile_image_url": l.customer.profile_image_url if l.customer else None,
+                },
+                "guarantor": ({
+                    "id": l.guarantor.id,
+                    "name": l.guarantor.name,
+                    "id_number": l.guarantor.id_number,
+                    "phone": l.guarantor.phone,
+                    "location": l.guarantor.location,
+                    "relationship": l.guarantor.relationship,
+                } if l.guarantor else None),
+            }
+            for l in loans
+        ],
+        "limit": limit,
+        "offset": offset,
+        "count": len(loans),
+        "has_more": len(loans) == limit
+    }
+
 
 
 @router.get("/{loan_id}")

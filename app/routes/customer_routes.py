@@ -115,15 +115,30 @@ async def _serialize_loans_with_progress(db: AsyncSession, loans: List[Loan]):
 
 @router.get("/")
 async def list_customers(
+    q: str | None = None,
     limit: int = 50,
     offset: int = 0,
     db: AsyncSession = Depends(get_db),
     current_user=Depends(get_current_user)
 ):
-    """List customers with basic info (paginated)"""
-    result = await db.execute(
-        select(Customer).order_by(Customer.created_at.desc()).limit(limit).offset(offset)
-    )
+    """List customers with basic info (paginated, with optional search)"""
+    base_stmt = select(Customer)
+    
+    # 🔍 FILTER FIRST if search query provided
+    if q:
+        q = q.strip()
+        base_stmt = base_stmt.where(
+            or_(
+                Customer.name.ilike(f"%{q}%"),
+                Customer.phone.ilike(f"%{q}%"),
+                Customer.id_number.ilike(f"%{q}%"),
+                Customer.location.ilike(f"%{q}%"),
+            )
+        )
+    
+    # 📄 THEN paginate
+    stmt = base_stmt.order_by(Customer.created_at.desc()).limit(limit).offset(offset)
+    result = await db.execute(stmt)
     customers = result.scalars().all()
 
     # Determine which customers currently have active loans
